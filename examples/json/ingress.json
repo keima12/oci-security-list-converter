@@ -15,6 +15,19 @@
     "description": "文書用IPv6 TCP全宛先ポート"
   },
   {
+    "protocol": "6",
+    "isStateless": false,
+    "source": "oci-phx-objectstorage",
+    "sourceType": "SERVICE_CIDR_BLOCK",
+    "description": "公開サービスラベルを使ったIngress形式例",
+    "tcpOptions": {
+      "destinationPortRange": {
+        "min": 443,
+        "max": 443
+      }
+    }
+  },
+  {
     "protocol": "17",
     "isStateless": false,
     "source": "203.0.113.0/24",

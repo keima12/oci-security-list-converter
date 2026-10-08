@@ -22,6 +22,22 @@
         "icmp-options": null
       },
       {
+        "protocol": "6",
+        "is-stateless": false,
+        "source": "oci-phx-objectstorage",
+        "source-type": "SERVICE_CIDR_BLOCK",
+        "description": "公開サービスラベルを使ったIngress形式例",
+        "tcp-options": {
+          "destination-port-range": {
+            "min": 443,
+            "max": 443
+          },
+          "source-port-range": null
+        },
+        "udp-options": null,
+        "icmp-options": null
+      },
+      {
         "protocol": "17",
         "is-stateless": false,
         "source": "203.0.113.0/24",
@@ -70,6 +86,22 @@
         "destination-type": "CIDR_BLOCK",
         "description": "文書用TCP宛先ポート範囲",
         "tcp-options": {"destination-port-range": {"min": 1024, "max": 2048}, "source-port-range": null},
+        "udp-options": null,
+        "icmp-options": null
+      },
+      {
+        "protocol": "6",
+        "is-stateless": false,
+        "destination": "all-phx-services-in-oracle-services-network",
+        "destination-type": "SERVICE_CIDR_BLOCK",
+        "description": "公開サービスラベルを使ったEgress形式例",
+        "tcp-options": {
+          "destination-port-range": {
+            "min": 443,
+            "max": 443
+          },
+          "source-port-range": null
+        },
         "udp-options": null,
         "icmp-options": null
       },

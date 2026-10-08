@@ -8,6 +8,19 @@
     "tcpOptions": {"destinationPortRange": {"min": 1024, "max": 2048}}
   },
   {
+    "protocol": "6",
+    "isStateless": false,
+    "destination": "all-phx-services-in-oracle-services-network",
+    "destinationType": "SERVICE_CIDR_BLOCK",
+    "description": "公開サービスラベルを使ったEgress形式例",
+    "tcpOptions": {
+      "destinationPortRange": {
+        "min": 443,
+        "max": 443
+      }
+    }
+  },
+  {
     "protocol": "17",
     "isStateless": true,
     "destination": "198.51.100.0/24",

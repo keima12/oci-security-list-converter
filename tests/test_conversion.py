@@ -1,4 +1,4 @@
-"""Round-trip and fail-closed tests; fixtures contain documentation addresses only."""
+"""Round-trip and fail-closed tests with documentation CIDRs and synthetic service labels."""
 
 import argparse
 import contextlib
@@ -33,6 +33,17 @@ def make_rule(direction, protocol_code, **extra):
     address_type = "sourceType" if direction == "ingress" else "destinationType"
     rule = {"protocol": protocol_code, address: "192.0.2.0/24",
             address_type: "CIDR_BLOCK", "isStateless": False}
+    rule.update(extra)
+    return rule
+
+
+def make_service_rule(direction, protocol_code, label="oci-example-objectstorage", **extra):
+    """Use an opaque, synthetic service label rather than a real environment export."""
+    address = "source" if direction == "ingress" else "destination"
+    address_type = "sourceType" if direction == "ingress" else "destinationType"
+    rule = make_rule(direction, protocol_code, **{
+        address: label, address_type: "SERVICE_CIDR_BLOCK"
+    })
     rule.update(extra)
     return rule
 
@@ -81,18 +92,24 @@ class ConversionTests(unittest.TestCase):
         return {direction: json.loads((output / f"{direction}.json").read_text(encoding="utf-8"))
                 for direction in ("ingress", "egress")}
 
-    def write_tables(self, tables=None):
+    def write_tables(self, tables=None, legacy=False):
         directory = self.work / "input-csv"
         directory.mkdir(exist_ok=True)
         for protocol, fields in CSV_TO_JSON.CSV_FIELDS.items():
+            if legacy:
+                fields = [field for field in fields if field != "address_type"]
             with (directory / f"{protocol}.csv").open("w", encoding="utf-8-sig", newline="") as stream:
                 writer = csv.DictWriter(stream, fieldnames=fields)
                 writer.writeheader()
-                writer.writerows((tables or {}).get(protocol, []))
+                for row in (tables or {}).get(protocol, []):
+                    if legacy:
+                        row = {key: value for key, value in row.items() if key != "address_type"}
+                    writer.writerow(row)
         return directory
 
     def row(self, protocol):
-        row = {"direction": "ingress", "cidr": "192.0.2.0/24", "stateless": "false",
+        row = {"direction": "ingress", "cidr": "192.0.2.0/24", "address_type": "CIDR_BLOCK",
+               "stateless": "false",
                "description": ""}
         if protocol in ("tcp", "udp"):
             row.update(dst_min="all", dst_max="all")
@@ -145,6 +162,207 @@ class ConversionTests(unittest.TestCase):
         get = self.write_json("get.json", {"ingressSecurityRules": rules["ingress"],
                                            "egressSecurityRules": rules["egress"]})
         self.assertEqual(self.import_csv(self.export(get=get)), rules)
+
+    def service_rules(self):
+        rules = {}
+        description = '  日本語のサービス説明, "引用符"\n2行目\r\n3行目  '
+        for direction in ("ingress", "egress"):
+            rules[direction] = [
+                make_service_rule(direction, "6", description=description, isStateless=True,
+                                  tcpOptions={"destinationPortRange": {"min": 443, "max": 443}}),
+                make_service_rule(direction, "17", description=description,
+                                  udpOptions={"destinationPortRange": {"min": 5000, "max": 5010}}),
+                make_service_rule(direction, "1", description=description,
+                                  icmpOptions={"type": 3, "code": 4}),
+                make_service_rule(direction, "all", description=description, isStateless=True),
+            ]
+        return rules
+
+    def test_csv_export_schema_includes_explicit_address_type(self):
+        expected_fields = {
+            "tcp": ["direction", "cidr", "address_type", "dst_min", "dst_max", "stateless", "description"],
+            "udp": ["direction", "cidr", "address_type", "dst_min", "dst_max", "stateless", "description"],
+            "icmp": ["direction", "cidr", "address_type", "type", "code", "stateless", "description"],
+            "all": ["direction", "cidr", "address_type", "stateless", "description"],
+        }
+        directory = self.export()
+        for protocol, fields in expected_fields.items():
+            with self.subTest(protocol=protocol):
+                with (directory / f"{protocol}.csv").open(encoding="utf-8-sig", newline="") as stream:
+                    self.assertEqual(list(csv.reader(stream)), [fields])
+
+    def test_service_arrays_round_trip_all_protocols_directions_and_descriptions(self):
+        rules = self.service_rules()
+        directory = self.export(rules["ingress"], rules["egress"])
+        for protocol in ("tcp", "udp", "icmp", "all"):
+            with self.subTest(protocol=protocol):
+                with (directory / f"{protocol}.csv").open(encoding="utf-8-sig", newline="") as stream:
+                    rows = list(csv.DictReader(stream))
+                self.assertEqual([row["direction"] for row in rows], ["ingress", "egress"])
+                self.assertEqual([row["address_type"] for row in rows],
+                                 ["SERVICE_CIDR_BLOCK", "SERVICE_CIDR_BLOCK"])
+                self.assertEqual([row["cidr"] for row in rows],
+                                 ["oci-example-objectstorage", "oci-example-objectstorage"])
+        self.assertEqual(self.import_csv(directory), rules)
+
+    def test_mixed_service_and_ip_cidrs_round_trip_cli_get_hyphenated_keys(self):
+        service_rules = self.service_rules()
+        rules = {}
+        for direction in ("ingress", "egress"):
+            rules[direction] = []
+            for service_rule in service_rules[direction]:
+                rules[direction].extend([
+                    make_rule(direction, service_rule["protocol"], description="文書用IP CIDR"),
+                    service_rule,
+                ])
+        get = self.write_json("service-get.json", {"data": hyphen_keys({
+            "displayName": "Synthetic service example", "id": "synthetic-resource",
+            "ingressSecurityRules": rules["ingress"], "egressSecurityRules": rules["egress"]
+        }), "etag": "synthetic-etag"})
+        directory = self.export(get=get)
+        for protocol in ("tcp", "udp", "icmp", "all"):
+            with self.subTest(protocol=protocol):
+                with (directory / f"{protocol}.csv").open(encoding="utf-8-sig", newline="") as stream:
+                    rows = list(csv.DictReader(stream))
+                self.assertEqual([row["address_type"] for row in rows],
+                                 ["CIDR_BLOCK", "SERVICE_CIDR_BLOCK"] * 2)
+                self.assertNotIn("id", rows[0])
+        self.assertEqual(self.import_csv(directory), rules)
+
+    def test_csv_service_labels_and_descriptions_are_preserved_as_opaque_text(self):
+        label = '  synthetic label, "quoted"\nsecond line  '
+        description = ' =1+1, "説明の引用符"\r\n空白を保持  '
+        tables = {}
+        expected = {"ingress": [], "egress": []}
+        for protocol, code in (("tcp", "6"), ("udp", "17"), ("icmp", "1"), ("all", "all")):
+            tables[protocol] = []
+            for direction in ("ingress", "egress"):
+                row = self.row(protocol)
+                row.update(direction=direction, cidr=label, address_type=" SERVICE_CIDR_BLOCK ",
+                           description=description)
+                tables[protocol].append(row)
+                expected[direction].append(make_service_rule(direction, code, label,
+                                                               description=description))
+        converted = self.import_csv(self.write_tables(tables))
+        self.assertEqual(converted, expected)
+        self.assertEqual(self.import_csv(self.export(converted["ingress"], converted["egress"]),
+                                         output=self.work / "roundtrip-json"), expected)
+
+    def test_legacy_csv_without_address_type_defaults_to_cidr_for_all_protocols(self):
+        tables = {}
+        expected = {"ingress": [], "egress": []}
+        for protocol, code in (("tcp", "6"), ("udp", "17"), ("icmp", "1"), ("all", "all")):
+            tables[protocol] = []
+            for direction in ("ingress", "egress"):
+                row = self.row(protocol)
+                row.update(direction=direction, description="旧CSV互換")
+                tables[protocol].append(row)
+                expected[direction].append(make_rule(direction, code, description="旧CSV互換"))
+        self.assertEqual(self.import_csv(self.write_tables(tables, legacy=True)), expected)
+
+    def test_blank_csv_address_type_defaults_to_cidr(self):
+        for address_type in ("", " \t "):
+            with self.subTest(address_type=address_type):
+                tables = {}
+                expected = {"ingress": [], "egress": []}
+                for protocol, code in (("tcp", "6"), ("udp", "17"), ("icmp", "1"), ("all", "all")):
+                    tables[protocol] = []
+                    for direction in ("ingress", "egress"):
+                        row = self.row(protocol)
+                        row.update(direction=direction, address_type=address_type)
+                        tables[protocol].append(row)
+                        expected[direction].append(make_rule(direction, code))
+                self.assertEqual(self.import_csv(self.write_tables(tables), force=True), expected)
+
+    def test_csv_cidr_address_type_allows_surrounding_whitespace(self):
+        for protocol, code in (("tcp", "6"), ("udp", "17"), ("icmp", "1"), ("all", "all")):
+            with self.subTest(protocol=protocol):
+                row = self.row(protocol)
+                row["address_type"] = " \tCIDR_BLOCK\t "
+                self.assertEqual(CSV_TO_JSON.convert_rule(row, protocol),
+                                 ("ingress", make_rule("ingress", code)))
+
+    def test_csv_unknown_address_types_are_rejected_before_output(self):
+        for address_type in ("UNKNOWN", "NETWORK_SECURITY_GROUP", "cidr_block", "service_cidr_block"):
+            for protocol in ("tcp", "udp", "icmp", "all"):
+                for direction in ("ingress", "egress"):
+                    with self.subTest(address_type=address_type, protocol=protocol, direction=direction):
+                        row = self.row(protocol)
+                        row.update(direction=direction, address_type=address_type)
+                        with self.assertRaises(ValueError):
+                            self.import_csv(self.write_tables({protocol: [row]}))
+                        self.assertFalse((self.work / "json").exists())
+
+    def test_json_unknown_address_types_are_rejected_before_output(self):
+        for address_type in ("", " ", "UNKNOWN", "NETWORK_SECURITY_GROUP", "cidr_block",
+                             "service_cidr_block", " CIDR_BLOCK ", False, 1):
+            for direction in ("ingress", "egress"):
+                with self.subTest(address_type=address_type, direction=direction):
+                    type_key = "sourceType" if direction == "ingress" else "destinationType"
+                    rule = make_rule(direction, "all", **{type_key: address_type})
+                    with self.assertRaises(ValueError):
+                        self.export(**{direction: [rule]})
+                    self.assertFalse((self.work / "csv").exists())
+
+    def test_empty_service_labels_are_rejected_in_both_directions_and_formats(self):
+        for label in ("", " ", "\t\r\n"):
+            for protocol, code in (("tcp", "6"), ("udp", "17"), ("icmp", "1"), ("all", "all")):
+                for direction in ("ingress", "egress"):
+                    with self.subTest(label=label, protocol=protocol, direction=direction):
+                        row = self.row(protocol)
+                        row.update(direction=direction, cidr=label, address_type="SERVICE_CIDR_BLOCK")
+                        with self.assertRaises(ValueError):
+                            CSV_TO_JSON.convert_rule(row, protocol)
+                        with self.assertRaises(ValueError):
+                            JSON_TO_CSV.convert_rule(make_service_rule(direction, code, label), direction, 1)
+        for label in (None, 1, True, [], {}):
+            for direction in ("ingress", "egress"):
+                with self.subTest(label=label, direction=direction):
+                    with self.assertRaises(ValueError):
+                        JSON_TO_CSV.convert_rule(make_service_rule(direction, "all", label), direction, 1)
+
+    def test_service_label_is_not_inferred_from_missing_or_blank_address_type(self):
+        for protocol, code in (("tcp", "6"), ("udp", "17"), ("icmp", "1"), ("all", "all")):
+            for direction in ("ingress", "egress"):
+                for address_type in (None, "", " "):
+                    with self.subTest(protocol=protocol, direction=direction, address_type=address_type):
+                        row = self.row(protocol)
+                        row.update(direction=direction, cidr="oci-example-objectstorage")
+                        if address_type is None:
+                            row.pop("address_type")
+                        else:
+                            row["address_type"] = address_type
+                        with self.assertRaises(ValueError):
+                            CSV_TO_JSON.convert_rule(row, protocol)
+                for missing in (True, False):
+                    with self.subTest(protocol=protocol, direction=direction, missing=missing):
+                        rule = make_service_rule(direction, code)
+                        type_key = "sourceType" if direction == "ingress" else "destinationType"
+                        if missing:
+                            rule.pop(type_key)
+                        else:
+                            rule[type_key] = None
+                        with self.assertRaises(ValueError):
+                            JSON_TO_CSV.convert_rule(rule, direction, 1)
+
+    def test_invalid_service_labels_do_not_modify_existing_outputs(self):
+        output_csv = self.export()
+        before_csv = {path.name: path.read_bytes() for path in output_csv.iterdir()}
+        with self.assertRaises(ValueError):
+            self.export([make_rule("ingress", "6")],
+                        [make_service_rule("egress", "all", " ")],
+                        output=output_csv, force=True)
+        self.assertEqual({path.name: path.read_bytes() for path in output_csv.iterdir()}, before_csv)
+        directory = self.write_tables()
+        output_json = self.work / "json"
+        self.import_csv(directory)
+        before_json = {path.name: path.read_bytes() for path in output_json.iterdir()}
+        invalid = self.row("all")
+        invalid.update(direction="egress", cidr=" ", address_type="SERVICE_CIDR_BLOCK")
+        directory = self.write_tables({"tcp": [self.row("tcp")], "all": [invalid]})
+        with self.assertRaises(ValueError):
+            self.import_csv(directory, output=output_json, force=True)
+        self.assertEqual({path.name: path.read_bytes() for path in output_json.iterdir()}, before_json)
 
     def test_empty_rules_write_four_headers_and_two_empty_arrays(self):
         directory = self.export()
@@ -243,7 +461,7 @@ class ConversionTests(unittest.TestCase):
     def test_invalid_json_rules_are_rejected(self):
         patches = [
             {"protocol": True}, {"protocol": None}, {"protocol": "58"},
-            {"protocol": "132"}, {"protocol": 6.0}, {"sourceType": "SERVICE_CIDR_BLOCK"},
+            {"protocol": "132"}, {"protocol": 6.0}, {"sourceType": "UNKNOWN"},
             {"sourceType": ""}, {"sourceType": False}, {"source": "192.0.2.5/24"},
             {"source": "2001:db8::1/32"}, {"source": 1}, {"source": "bad"},
             {"isStateless": "true"}, {"isStateless": 1}, {"description": 123},

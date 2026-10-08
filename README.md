@@ -1,6 +1,6 @@
 # OCIセキュリティ・リスト CSV ⇔ JSON変換ツール
 
-OCIセキュリティ・リストのIngress/Egressルールを、編集しやすい4種類のCSVとOCI CLI入力用JSON配列の間で変換するPythonスクリプトです。`oci network security-list get`で取得した標準JSONからCSVへの変換にも対応します。
+OCIセキュリティ・リストのIngress/Egressルールを、編集しやすい4種類のCSVとOCI CLI入力用JSON配列の間で変換するPythonスクリプトです。通常のCIDR（`CIDR_BLOCK`）とサービスCIDR（`SERVICE_CIDR_BLOCK`）の両方を扱い、`oci network security-list get`で取得した標準JSONからCSVへの変換にも対応します。
 
 変換スクリプト自体はOCI APIを呼び出しません。生成したJSONをOCIに適用する操作は、利用者が内容を確認した後に別途実行します。
 
@@ -21,7 +21,7 @@ examples/
   oci-get.json                  dataラッパー・ハイフン区切りキーの合成例
 ```
 
-公開例のCIDRは`192.0.2.0/24`、`198.51.100.0/24`、`203.0.113.0/24`、`2001:db8::/32`配下の文書用アドレスのみです。実環境のOCID・資格情報・内部CIDRを含みません。`examples/oci-get.json`は形式説明用に作成したデータであり、実環境から取得したJSONではありません。リソースIDなどのメタデータは例から省いています。
+公開例のIP CIDRは`192.0.2.0/24`、`198.51.100.0/24`、`203.0.113.0/24`、`2001:db8::/32`配下の文書用アドレスのみです。サービスCIDRの例にはOracle公式資料にある公開ラベルを使用しています。実環境のOCID・資格情報・内部CIDRを含みません。`examples/oci-get.json`は形式説明用に作成したデータであり、実環境から取得したJSONではありません。リソースIDなどのメタデータは例から省いています。
 
 ## まず合成例で試す
 
@@ -105,19 +105,22 @@ get出力のリソースOCID、コンパートメントOCID、表示名、タグ
 
 ## CSVの形式
 
-CSV → JSONでは、入力ディレクトリに4枚のCSVがすべて必要です。あるプロトコルのルールがない場合は、そのCSVをヘッダー行だけにします。列の不足・余分な列・重複列はエラーになります。
+CSV → JSONでは、入力ディレクトリに4枚のCSVがすべて必要です。あるプロトコルのルールがない場合は、そのCSVをヘッダー行だけにします。`address_type`以外の列の不足・余分な列・重複列はエラーになります。
 
 | ファイル | ヘッダー |
 | --- | --- |
-| `tcp.csv` | `direction,cidr,dst_min,dst_max,stateless,description` |
-| `udp.csv` | `direction,cidr,dst_min,dst_max,stateless,description` |
-| `icmp.csv` | `direction,cidr,type,code,stateless,description` |
-| `all.csv` | `direction,cidr,stateless,description` |
+| `tcp.csv` | `direction,cidr,address_type,dst_min,dst_max,stateless,description` |
+| `udp.csv` | `direction,cidr,address_type,dst_min,dst_max,stateless,description` |
+| `icmp.csv` | `direction,cidr,address_type,type,code,stateless,description` |
+| `all.csv` | `direction,cidr,address_type,stateless,description` |
+
+JSON → CSVは常に`address_type`列を出力します。CSV → JSONは、この列がない旧形式のCSVも受け付けます。列がない場合・値が空欄の場合は`CIDR_BLOCK`として扱います。新しいCSVを読み込む際は、CSV → JSONスクリプトも本リポジトリの最新版を使用してください。
 
 | 列 | 指定方法 |
 | --- | --- |
 | `direction` | `ingress`または`egress`。Ingressでは`cidr`を`source`、Egressでは`destination`に変換します。 |
-| `cidr` | 有効なIPv4/IPv6ネットワークのCIDR。ホストビットが立った値はエラーです。例：`192.0.2.1/24`ではなく`192.0.2.0/24`。 |
+| `cidr` | `CIDR_BLOCK`では有効なIPv4/IPv6ネットワークのCIDR。ホストビットが立った値はエラーです。例：`192.0.2.1/24`ではなく`192.0.2.0/24`。`SERVICE_CIDR_BLOCK`ではサービスCIDRラベル文字列。 |
+| `address_type` | `CIDR_BLOCK`または`SERVICE_CIDR_BLOCK`。Ingressの`sourceType`、Egressの`destinationType`に対応します。前後の空白を除いて大文字の値を指定します。空欄・列省略は`CIDR_BLOCK`。未知の種別はエラーです。 |
 | `dst_min`,`dst_max` | このツールでは1～65535の整数、かつ`dst_min <= dst_max`。単一ポートは同じ値を指定します。両列を`all`にすると宛先全ポートです。空欄や片方だけの`all`はエラーです。 |
 | `type`,`code` | IPv4 ICMPの0～255の整数。タイプを指定してコードを空欄にすると、そのタイプの全コード。両方空欄にすると全ICMPタイプ・コード。コードだけの指定はエラーです。 |
 | `stateless` | `true`または`false`。`false`はステートフルです。 |
@@ -127,11 +130,30 @@ CSV → JSONでは、入力ディレクトリに4枚のCSVがすべて必要で�
 
 入力CSV・JSONはUTF-8（BOMの有無はどちらも可）です。JSON → CSVの出力はUTF-8 BOM付きで、CSV → JSONの出力はUTF-8です。カンマ・引用符・改行を含む説明文は、通常のCSV規則に従って引用します。`examples/csv/icmp.csv`に改行を含む説明の例があります。
 
+### サービスCIDRを指定する
+
+`cidr`列には`Service.cidrBlock`の値を指定します。サービスのOCIDやコンソールの表示名ではありません。たとえば次のTCP Egress行は、宛先サービスラベルと宛先ポート443を保持します。
+
+```csv
+direction,cidr,address_type,dst_min,dst_max,stateless,description
+egress,all-phx-services-in-oracle-services-network,SERVICE_CIDR_BLOCK,443,443,false,公開サービスラベルを使った形式例
+```
+
+この例のラベルはPHXリージョンの公開例です。そのまま別リージョンに適用せず、利用するリージョンで取得したサービス一覧の`cidr-block`を使用してください。取得例（リージョンは利用環境に合わせて変更）：
+
+```shell
+oci network service list --all --region ap-tokyo-1 --output json
+```
+
+JSON → CSVでは`sourceType`/`destinationType`（get形式では`source-type`/`destination-type`）とラベルを保持し、CSV → JSONでは対応する種別とラベルに戻します。IP CIDRとサービスCIDRは、同じCSV内で混在できます。`examples/csv/tcp.csv`、`examples/json/ingress.json`、`examples/json/egress.json`、`examples/oci-get.json`に両方向のサービスCIDR形式例があります。
+
+サービスCIDRラベルはIP CIDRとして解析せず、空・空白のみの値を拒否し、それ以外の文字列は変更せず保持します。ラベルが実在するか、対象リージョンで利用できるか、通信要件・経路・サービスとの対応が正しいかは、このローカル変換では確認しません。不要な空白なども利用者が確認してください。サービスCIDRルールの変換成功は、Oracleサービスからの新規接続や通信全体の成立を保証しません。
+
 ## 対応範囲と制限
 
 - Ingress/Egress、TCP（6）、UDP（17）、IPv4 ICMP（1）、ALL（`all`）に対応します。
 - TCP/UDP/ALLはIPv4・IPv6 CIDRに対応します。ICMPv6（58）は未対応です。
-- アドレス種別は`CIDR_BLOCK`に対応します。`SERVICE_CIDR_BLOCK`は未対応です。
+- アドレス種別は`CIDR_BLOCK`と`SERVICE_CIDR_BLOCK`に両方向で対応します。サービスCIDRもTCP/UDP/IPv4 ICMP/ALLの形式を変換できます。サービスラベルの実在確認やIP範囲への展開は行いません。
 - TCP/UDPは宛先ポート範囲だけを扱います。送信元ポート制限（`sourcePortRange`）を含むルールは未対応です。
 - その他の数値プロトコルやCSVで表現できない項目を含むルールは、黙って落とさず明示的なエラーにします。
 - ポート1～65535はこのツールの対応範囲です。ポート0をOCI自体が受け付けないと断定するものではありません。
@@ -177,15 +199,15 @@ ETag不一致の場合は対象が変更されています。再取得して内�
 python -m unittest discover -s tests -v
 ```
 
-26件の自動テストで、両方向・4種類のプロトコル・get形式・説明文の往復、未対応項目の検出、不正なCSV/JSON、重複キー、上書き防止、出力準備中の失敗時の既存ファイル保護を確認しています。公開準備時はWindows/Python 3.13で成功しました。Python 3.9以上向けに実装していますが、全バージョン・全OSでの実行試験は行っていません。
+38件の自動テストで、両方向・4種類のプロトコル・get形式・説明文の往復、サービスCIDRの保持、IP CIDRとの混在、旧CSVとの互換性、未知のアドレス種別と空サービスラベルの検出、不正なCSV/JSON、重複キー、上書き防止、出力準備中の失敗時の既存ファイル保護を確認しています。Windows/Python 3.13で成功しました。Python 3.9以上向けに実装していますが、全バージョン・全OSでの実行試験は行っていません。
 
 出力はすべてのファイルを一時書込みしてから、1ファイルずつ確定します。複数ファイル全体を一括で更新する保証はありません。出力の確定中にディスク障害などが発生した場合は、別の空ディレクトリで再実行し、出力一式を確認してください。Windows以外では、`--force`なしの出力にハードリンクを使うため、対応するファイルシステム上の保存先を使用してください。
 
 ## ExcelなどでCSVを開く場合
 
-説明文が`=`、`+`、`-`、`@`などで始まる場合、表計算ソフトが数式として解釈する可能性があります。外部から取得したCSVはダブルクリックで開かず、取り込み時に説明列を文字列として指定するなど、使用するソフトに合わせて対処してください。必要に応じてテキストエディターで確認してください。
+説明文やサービスCIDRラベル（`cidr`列）が`=`、`+`、`-`、`@`などで始まる場合、表計算ソフトが数式として解釈する可能性があります。外部から取得したCSVはダブルクリックで開かず、取り込み時に`description`列と`cidr`列を文字列として指定するなど、使用するソフトに合わせて対処してください。必要に応じてテキストエディターで確認してください。
 
-このツールは説明文を保持するため、先頭へのアポストロフィ追加などの自動変更は行いません。CSVの引用符だけでは数式の解釈を防げません。Excelでの保存時には、UTF-8 CSV、列名、CIDR、整数値、説明文の改行が維持されていることも確認してください。
+このツールは説明文とサービスCIDRラベルを保持するため、先頭へのアポストロフィ追加などの自動変更は行いません。CSVの引用符だけでは数式の解釈を防げません。Excelでの保存時には、UTF-8 CSV、列名、アドレス種別、CIDRやサービスCIDRラベル、整数値、説明文の改行が維持されていることも確認してください。
 
 ## ライセンス
 
@@ -195,11 +217,14 @@ python -m unittest discover -s tests -v
 
 - [Oracle公式：セキュリティ・リスト（日本語）](https://docs.oracle.com/ja-jp/iaas/Content/Network/Concepts/securitylists.htm)
 - [Oracle公式：セキュリティ・ルール（日本語）](https://docs.oracle.com/ja-jp/iaas/Content/Network/Concepts/securityrules.htm)
+- [Oracle公式：サービス・ゲートウェイとサービスCIDRラベル（日本語）](https://docs.oracle.com/ja-jp/iaas/Content/Network/Tasks/servicegateway.htm)
 - [Oracle公式：CLIの開始・レスポンス例（日本語）](https://docs.oracle.com/ja-jp/iaas/Content/GSG/Tasks/gettingstartedwiththeCLI.htm)
 - [OCI CLI：network security-list get](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/network/security-list/get.html)
 - [OCI CLI：network security-list update](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/network/security-list/update.html)
+- [OCI CLI：network service list](https://docs.oracle.com/en-us/iaas/tools/oci-cli/latest/oci_cli_docs/cmdref/network/service/list.html)
 - [OCI SDK：IngressSecurityRule（説明文を含む現行モデル）](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.IngressSecurityRule.html)
 - [OCI SDK：EgressSecurityRule](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.EgressSecurityRule.html)
+- [OCI SDK：Service（cidrBlockの値）](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.Service.html)
 - [OCI SDK：IcmpOptions](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.IcmpOptions.html)
 - [OCI SDK：PortRange](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/core/models/oci.core.models.PortRange.html)
 

@@ -16,10 +16,10 @@ import tempfile
 from pathlib import Path
 
 CSV_FIELDS = {
-    "tcp": ["direction", "cidr", "dst_min", "dst_max", "stateless", "description"],
-    "udp": ["direction", "cidr", "dst_min", "dst_max", "stateless", "description"],
-    "icmp": ["direction", "cidr", "type", "code", "stateless", "description"],
-    "all": ["direction", "cidr", "stateless", "description"],
+    "tcp": ["direction", "cidr", "address_type", "dst_min", "dst_max", "stateless", "description"],
+    "udp": ["direction", "cidr", "address_type", "dst_min", "dst_max", "stateless", "description"],
+    "icmp": ["direction", "cidr", "address_type", "type", "code", "stateless", "description"],
+    "all": ["direction", "cidr", "address_type", "stateless", "description"],
 }
 PROTOCOLS = {"tcp": "6", "udp": "17", "icmp": "1", "all": "all"}
 
@@ -38,12 +38,22 @@ def convert_rule(row, protocol):
     if direction not in ("ingress", "egress"):
         raise ValueError("directionにはingressまたはegressを指定してください")
 
-    try:
-        network = ipaddress.ip_network(row["cidr"].strip(), strict=True)
-    except ValueError as exc:
-        raise ValueError(f"cidrが不正です: {row['cidr']!r}") from exc
-    if protocol == "icmp" and network.version != 4:
-        raise ValueError("icmp.csvはIPv4のICMPのみ対応です")
+    address_type = row.get("address_type", "").strip() or "CIDR_BLOCK"
+    if address_type not in ("CIDR_BLOCK", "SERVICE_CIDR_BLOCK"):
+        raise ValueError(f"address_typeはCIDR_BLOCKまたはSERVICE_CIDR_BLOCKが必要です: {address_type!r}")
+    address = row["cidr"]
+    if address_type == "CIDR_BLOCK":
+        try:
+            network = ipaddress.ip_network(address.strip(), strict=True)
+        except ValueError as exc:
+            raise ValueError(f"cidrが不正です: {address!r}") from exc
+        if protocol == "icmp" and network.version != 4:
+            raise ValueError("icmp.csvはIPv4のICMPのみ対応です")
+        address = str(network)
+    elif not address.strip():
+        raise ValueError("SERVICE_CIDR_BLOCKのcidrには空でないサービスCIDRラベルが必要です")
+    # Service CIDR labels are opaque strings. Preserve them exactly; no OCI
+    # lookup or CIDR parsing is performed for SERVICE_CIDR_BLOCK.
 
     state_text = row["stateless"].strip().lower()
     if state_text not in ("true", "false"):
@@ -55,8 +65,8 @@ def convert_rule(row, protocol):
     }
     address_key = "source" if direction == "ingress" else "destination"
     type_key = "sourceType" if direction == "ingress" else "destinationType"
-    rule[address_key] = str(network)
-    rule[type_key] = "CIDR_BLOCK"
+    rule[address_key] = address
+    rule[type_key] = address_type
 
     # Keep the description *exactly* as stored in CSV, including whitespace,
     # non-ASCII characters, quotes, commas and line breaks. Blank means unset.
@@ -102,7 +112,9 @@ def read_csv(path, protocol):
             raise ValueError(f"{path}: CSVのヘッダー行がありません")
         if len(actual) != len(set(actual)):
             raise ValueError(f"{path}: CSVヘッダーが重複しています")
-        missing = set(CSV_FIELDS[protocol]) - set(actual)
+        # address_type was added later; old CSV headers remain supported.
+        required = set(CSV_FIELDS[protocol]) - {"address_type"}
+        missing = required - set(actual)
         unexpected = set(actual) - set(CSV_FIELDS[protocol])
         if missing or unexpected:
             raise ValueError(

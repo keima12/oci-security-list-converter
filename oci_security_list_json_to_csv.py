@@ -21,10 +21,10 @@ import tempfile
 from pathlib import Path
 
 CSV_FIELDS = {
-    "tcp": ["direction", "cidr", "dst_min", "dst_max", "stateless", "description"],
-    "udp": ["direction", "cidr", "dst_min", "dst_max", "stateless", "description"],
-    "icmp": ["direction", "cidr", "type", "code", "stateless", "description"],
-    "all": ["direction", "cidr", "stateless", "description"],
+    "tcp": ["direction", "cidr", "address_type", "dst_min", "dst_max", "stateless", "description"],
+    "udp": ["direction", "cidr", "address_type", "dst_min", "dst_max", "stateless", "description"],
+    "icmp": ["direction", "cidr", "address_type", "type", "code", "stateless", "description"],
+    "all": ["direction", "cidr", "address_type", "stateless", "description"],
 }
 PROTOCOL_TO_CSV = {"6": "tcp", "17": "udp", "1": "icmp", "all": "all"}
 COMMON_FIELDS = {
@@ -131,18 +131,22 @@ def convert_rule(raw, direction, index):
     addr_type = rule.get(type_key)
     if addr_type is None:
         addr_type = "CIDR_BLOCK"
-    if addr_type != "CIDR_BLOCK":
-        die(f"{where}: {type_key}={addr_type!r}（サービスCIDR等）は未対応です")
+    if addr_type not in ("CIDR_BLOCK", "SERVICE_CIDR_BLOCK"):
+        die(f"{where}: 未対応の{type_key}={addr_type!r}（CIDR_BLOCK/SERVICE_CIDR_BLOCKのみ）")
     address = rule.get(addr_key)
     if not isinstance(address, str):
-        die(f"{where}: {addr_key}はCIDR文字列が必要です")
-    try:
-        network = ipaddress.ip_network(address, strict=True)
-    except ValueError as exc:
-        raise ValueError(f"{where}: CIDRが不正です: {address!r}") from exc
-
-    if name == "icmp" and network.version != 4:
-        die(f"{where}: IPv6 ICMPは前回のCSV→JSONスクリプトで未対応です")
+        die(f"{where}: {addr_key}はCIDRまたはサービスCIDRラベルの文字列が必要です")
+    if addr_type == "CIDR_BLOCK":
+        try:
+            network = ipaddress.ip_network(address, strict=True)
+        except ValueError as exc:
+            raise ValueError(f"{where}: CIDRが不正です: {address!r}") from exc
+        if name == "icmp" and network.version != 4:
+            die(f"{where}: IPv6 ICMPはCSV→JSONスクリプトで未対応です")
+        address = str(network)
+    elif not address.strip():
+        die(f"{where}: {addr_key}には空でないサービスCIDRラベルが必要です")
+    # Preserve opaque service labels without resolving or parsing their value.
 
     stateless = rule.get("isStateless", False)
     if stateless is None:
@@ -158,7 +162,8 @@ def convert_rule(raw, direction, index):
 
     csv_row = {
         "direction": direction,
-        "cidr": str(network),
+        "cidr": address,
+        "address_type": addr_type,
         "stateless": str(stateless).lower(),
         "description": description,
     }
