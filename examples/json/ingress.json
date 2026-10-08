@@ -1,0 +1,47 @@
+[
+  {
+    "protocol": "6",
+    "isStateless": false,
+    "source": "192.0.2.0/24",
+    "sourceType": "CIDR_BLOCK",
+    "description": "文書用HTTPS例, \"説明文の引用符\"を保持",
+    "tcpOptions": {"destinationPortRange": {"min": 443, "max": 443}}
+  },
+  {
+    "protocol": "6",
+    "isStateless": false,
+    "source": "2001:db8:1::/64",
+    "sourceType": "CIDR_BLOCK",
+    "description": "文書用IPv6 TCP全宛先ポート"
+  },
+  {
+    "protocol": "17",
+    "isStateless": false,
+    "source": "203.0.113.0/24",
+    "sourceType": "CIDR_BLOCK",
+    "description": "文書用UDP宛先ポート例",
+    "udpOptions": {"destinationPortRange": {"min": 53, "max": 53}}
+  },
+  {
+    "protocol": "1",
+    "isStateless": false,
+    "source": "192.0.2.0/24",
+    "sourceType": "CIDR_BLOCK",
+    "description": "文書用Path MTU Discoveryの形式例",
+    "icmpOptions": {"type": 3, "code": 4}
+  },
+  {
+    "protocol": "1",
+    "isStateless": true,
+    "source": "198.51.100.0/24",
+    "sourceType": "CIDR_BLOCK",
+    "description": "文書用の全ICMP例\n説明文の改行を保持"
+  },
+  {
+    "protocol": "all",
+    "isStateless": false,
+    "source": "2001:db8:2::/64",
+    "sourceType": "CIDR_BLOCK",
+    "description": "文書用IPv6 ALL例"
+  }
+]

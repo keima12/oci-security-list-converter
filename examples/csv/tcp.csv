@@ -1,0 +1,4 @@
+direction,cidr,dst_min,dst_max,stateless,description
+ingress,192.0.2.0/24,443,443,false,"文書用HTTPS例, ""説明文の引用符""を保持"
+egress,198.51.100.0/24,1024,2048,true,文書用TCP宛先ポート範囲
+ingress,2001:db8:1::/64,all,all,false,文書用IPv6 TCP全宛先ポート

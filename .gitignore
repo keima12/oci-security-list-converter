@@ -1,0 +1,31 @@
+# Runtime output and environment-specific exports
+/csv_export/
+/csv_restored/
+/json_output/
+/work/
+/local-data/
+/security-list.json
+/source.json
+/backup*.json
+
+# Credentials and local configuration
+.oci/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+config.local.*
+
+# Python and editors
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.idea/
+.vscode/
+*.tmp
+Thumbs.db
+.DS_Store

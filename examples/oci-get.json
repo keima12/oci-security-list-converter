@@ -1,0 +1,108 @@
+{
+  "data": {
+    "ingress-security-rules": [
+      {
+        "protocol": "6",
+        "is-stateless": false,
+        "source": "192.0.2.0/24",
+        "source-type": "CIDR_BLOCK",
+        "description": "文書用HTTPS例, \"説明文の引用符\"を保持",
+        "tcp-options": {"destination-port-range": {"min": 443, "max": 443}, "source-port-range": null},
+        "udp-options": null,
+        "icmp-options": null
+      },
+      {
+        "protocol": "6",
+        "is-stateless": false,
+        "source": "2001:db8:1::/64",
+        "source-type": "CIDR_BLOCK",
+        "description": "文書用IPv6 TCP全宛先ポート",
+        "tcp-options": null,
+        "udp-options": null,
+        "icmp-options": null
+      },
+      {
+        "protocol": "17",
+        "is-stateless": false,
+        "source": "203.0.113.0/24",
+        "source-type": "CIDR_BLOCK",
+        "description": "文書用UDP宛先ポート例",
+        "tcp-options": null,
+        "udp-options": {"destination-port-range": {"min": 53, "max": 53}, "source-port-range": null},
+        "icmp-options": null
+      },
+      {
+        "protocol": "1",
+        "is-stateless": false,
+        "source": "192.0.2.0/24",
+        "source-type": "CIDR_BLOCK",
+        "description": "文書用Path MTU Discoveryの形式例",
+        "tcp-options": null,
+        "udp-options": null,
+        "icmp-options": {"type": 3, "code": 4}
+      },
+      {
+        "protocol": "1",
+        "is-stateless": true,
+        "source": "198.51.100.0/24",
+        "source-type": "CIDR_BLOCK",
+        "description": "文書用の全ICMP例\n説明文の改行を保持",
+        "tcp-options": null,
+        "udp-options": null,
+        "icmp-options": null
+      },
+      {
+        "protocol": "all",
+        "is-stateless": false,
+        "source": "2001:db8:2::/64",
+        "source-type": "CIDR_BLOCK",
+        "description": "文書用IPv6 ALL例",
+        "tcp-options": null,
+        "udp-options": null,
+        "icmp-options": null
+      }
+    ],
+    "egress-security-rules": [
+      {
+        "protocol": "6",
+        "is-stateless": true,
+        "destination": "198.51.100.0/24",
+        "destination-type": "CIDR_BLOCK",
+        "description": "文書用TCP宛先ポート範囲",
+        "tcp-options": {"destination-port-range": {"min": 1024, "max": 2048}, "source-port-range": null},
+        "udp-options": null,
+        "icmp-options": null
+      },
+      {
+        "protocol": "17",
+        "is-stateless": true,
+        "destination": "198.51.100.0/24",
+        "destination-type": "CIDR_BLOCK",
+        "description": "文書用UDP全宛先ポート",
+        "tcp-options": null,
+        "udp-options": null,
+        "icmp-options": null
+      },
+      {
+        "protocol": "1",
+        "is-stateless": false,
+        "destination": "203.0.113.0/24",
+        "destination-type": "CIDR_BLOCK",
+        "description": "文書用ICMPタイプ指定・コード省略",
+        "tcp-options": null,
+        "udp-options": null,
+        "icmp-options": {"type": 8, "code": null}
+      },
+      {
+        "protocol": "all",
+        "is-stateless": false,
+        "destination": "203.0.113.0/24",
+        "destination-type": "CIDR_BLOCK",
+        "description": "文書用IPv4 ALL例",
+        "tcp-options": null,
+        "udp-options": null,
+        "icmp-options": null
+      }
+    ]
+  }
+}
