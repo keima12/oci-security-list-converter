@@ -1,6 +1,7 @@
 """Round-trip and fail-closed tests with documentation CIDRs and synthetic service labels."""
 
 import argparse
+import base64
 import contextlib
 import csv
 import importlib.util
@@ -82,7 +83,7 @@ class ConversionTests(unittest.TestCase):
             args.ingress = self.write_json("ingress-input.json", ingress or [])
             args.egress = self.write_json("egress-input.json", egress or [])
         with contextlib.redirect_stdout(io.StringIO()):
-            JSON_TO_CSV.export_csv(args)
+            self.last_unconverted = JSON_TO_CSV.export_csv(args)
         return args.output_dir
 
     def import_csv(self, directory, output=None, force=False):
@@ -95,7 +96,8 @@ class ConversionTests(unittest.TestCase):
     def write_tables(self, tables=None, legacy=False):
         directory = self.work / "input-csv"
         directory.mkdir(exist_ok=True)
-        for protocol, fields in CSV_TO_JSON.CSV_FIELDS.items():
+        for protocol in ("tcp", "udp", "icmp", "all"):
+            fields = CSV_TO_JSON.CSV_FIELDS[protocol]
             if legacy:
                 fields = [field for field in fields if field != "address_type"]
             with (directory / f"{protocol}.csv").open("w", encoding="utf-8-sig", newline="") as stream:
@@ -105,7 +107,46 @@ class ConversionTests(unittest.TestCase):
                     if legacy:
                         row = {key: value for key, value in row.items() if key != "address_type"}
                     writer.writerow(row)
+        if tables and "service" in tables:
+            with (directory / "service.csv").open("w", encoding="utf-8-sig", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=[
+                    "direction", "cidr", "protocol", "dst_min", "dst_max", "type", "code",
+                    "stateless", "description"])
+                writer.writeheader()
+                writer.writerows(tables["service"])
         return directory
+
+    def read_table(self, directory, name):
+        with (directory / f"{name}.csv").open(encoding="utf-8-sig", newline="") as stream:
+            return list(csv.DictReader(stream))
+
+    def read_report(self, directory):
+        return json.loads((directory / "unconverted-rules.json").read_text(encoding="utf-8"))
+
+    def assert_complete_report(self, directory):
+        report = self.read_report(directory)
+        self.assertEqual(report["format_version"], 1)
+        self.assertEqual(report["status"], "complete")
+        self.assertEqual(report["ingress"], [])
+        self.assertEqual(report["egress"], [])
+        self.assertEqual(self.last_unconverted, 0)
+
+    def service_row(self, protocol, direction="ingress", **changes):
+        row = {"direction": direction, "cidr": "oci-example-objectstorage", "protocol": protocol,
+               "dst_min": "", "dst_max": "", "type": "", "code": "",
+               "stateless": "false", "description": ""}
+        if protocol in ("tcp", "udp"):
+            row.update(dst_min="all", dst_max="all")
+        row.update(changes)
+        return row
+
+    def run_json_cli(self, arguments, output=None, force=False):
+        output = output or self.work / "cli-csv"
+        command = [sys.executable, str(ROOT / "oci_security_list_json_to_csv.py"),
+                   "--output-dir", str(output)] + arguments
+        if force:
+            command.append("--force")
+        return subprocess.run(command, cwd=self.work, capture_output=True), output
 
     def row(self, protocol):
         row = {"direction": "ingress", "cidr": "192.0.2.0/24", "address_type": "CIDR_BLOCK",
@@ -184,25 +225,32 @@ class ConversionTests(unittest.TestCase):
             "udp": ["direction", "cidr", "address_type", "dst_min", "dst_max", "stateless", "description"],
             "icmp": ["direction", "cidr", "address_type", "type", "code", "stateless", "description"],
             "all": ["direction", "cidr", "address_type", "stateless", "description"],
+            "service": ["direction", "cidr", "protocol", "dst_min", "dst_max", "type", "code",
+                        "stateless", "description"],
         }
         directory = self.export()
         for protocol, fields in expected_fields.items():
             with self.subTest(protocol=protocol):
                 with (directory / f"{protocol}.csv").open(encoding="utf-8-sig", newline="") as stream:
                     self.assertEqual(list(csv.reader(stream)), [fields])
+        self.assert_complete_report(directory)
 
     def test_service_arrays_round_trip_all_protocols_directions_and_descriptions(self):
         rules = self.service_rules()
         directory = self.export(rules["ingress"], rules["egress"])
         for protocol in ("tcp", "udp", "icmp", "all"):
-            with self.subTest(protocol=protocol):
-                with (directory / f"{protocol}.csv").open(encoding="utf-8-sig", newline="") as stream:
-                    rows = list(csv.DictReader(stream))
-                self.assertEqual([row["direction"] for row in rows], ["ingress", "egress"])
-                self.assertEqual([row["address_type"] for row in rows],
-                                 ["SERVICE_CIDR_BLOCK", "SERVICE_CIDR_BLOCK"])
-                self.assertEqual([row["cidr"] for row in rows],
-                                 ["oci-example-objectstorage", "oci-example-objectstorage"])
+            self.assertEqual(self.read_table(directory, protocol), [])
+        rows = self.read_table(directory, "service")
+        self.assertEqual(len(rows), 8)
+        self.assertEqual([row["direction"] for row in rows], ["ingress"] * 4 + ["egress"] * 4)
+        self.assertEqual([row["protocol"] for row in rows], ["tcp", "udp", "icmp", "all"] * 2)
+        self.assertEqual([row["cidr"] for row in rows], ["oci-example-objectstorage"] * 8)
+        self.assertNotIn("address_type", rows[0])
+        self.assertEqual((rows[0]["dst_min"], rows[0]["dst_max"], rows[0]["type"], rows[0]["code"]),
+                         ("443", "443", "", ""))
+        self.assertEqual((rows[2]["dst_min"], rows[2]["dst_max"], rows[2]["type"], rows[2]["code"]),
+                         ("", "", "3", "4"))
+        self.assert_complete_report(directory)
         self.assertEqual(self.import_csv(directory), rules)
 
     def test_mixed_service_and_ip_cidrs_round_trip_cli_get_hyphenated_keys(self):
@@ -224,9 +272,13 @@ class ConversionTests(unittest.TestCase):
             with self.subTest(protocol=protocol):
                 with (directory / f"{protocol}.csv").open(encoding="utf-8-sig", newline="") as stream:
                     rows = list(csv.DictReader(stream))
-                self.assertEqual([row["address_type"] for row in rows],
-                                 ["CIDR_BLOCK", "SERVICE_CIDR_BLOCK"] * 2)
+                self.assertEqual([row["address_type"] for row in rows], ["CIDR_BLOCK"] * 2)
                 self.assertNotIn("id", rows[0])
+        service_rows = self.read_table(directory, "service")
+        self.assertEqual(len(service_rows), 8)
+        self.assertEqual(sum(len(self.read_table(directory, name))
+                             for name in ("tcp", "udp", "icmp", "all", "service")), 16)
+        self.assert_complete_report(directory)
         self.assertEqual(self.import_csv(directory), rules)
 
     def test_csv_service_labels_and_descriptions_are_preserved_as_opaque_text(self):
@@ -293,16 +345,21 @@ class ConversionTests(unittest.TestCase):
                             self.import_csv(self.write_tables({protocol: [row]}))
                         self.assertFalse((self.work / "json").exists())
 
-    def test_json_unknown_address_types_are_rejected_before_output(self):
+    def test_json_unknown_address_types_are_saved_as_partial_without_stopping_export(self):
         for address_type in ("", " ", "UNKNOWN", "NETWORK_SECURITY_GROUP", "cidr_block",
                              "service_cidr_block", " CIDR_BLOCK ", False, 1):
             for direction in ("ingress", "egress"):
                 with self.subTest(address_type=address_type, direction=direction):
                     type_key = "sourceType" if direction == "ingress" else "destinationType"
                     rule = make_rule(direction, "all", **{type_key: address_type})
-                    with self.assertRaises(ValueError):
-                        self.export(**{direction: [rule]})
-                    self.assertFalse((self.work / "csv").exists())
+                    output = self.export(force=True, **{direction: [rule]})
+                    self.assertEqual(self.last_unconverted, 1)
+                    report = self.read_report(output)
+                    self.assertEqual(report["status"], "partial")
+                    self.assertEqual(report[direction][0]["rule"], rule)
+                    self.assertEqual(report[direction][0]["index"], 1)
+                    self.assertTrue(report[direction][0]["error"])
+                    self.assertEqual(report["egress" if direction == "ingress" else "ingress"], [])
 
     def test_empty_service_labels_are_rejected_in_both_directions_and_formats(self):
         for label in ("", " ", "\t\r\n"):
@@ -345,14 +402,16 @@ class ConversionTests(unittest.TestCase):
                         with self.assertRaises(ValueError):
                             JSON_TO_CSV.convert_rule(rule, direction, 1)
 
-    def test_invalid_service_labels_do_not_modify_existing_outputs(self):
+    def test_invalid_service_labels_make_json_export_partial_and_csv_import_fail_closed(self):
         output_csv = self.export()
-        before_csv = {path.name: path.read_bytes() for path in output_csv.iterdir()}
+        invalid_rule = make_service_rule("egress", "all", " ")
+        self.export([make_rule("ingress", "6")], [invalid_rule], output=output_csv, force=True)
+        self.assertEqual(self.last_unconverted, 1)
+        self.assertEqual(len(self.read_table(output_csv, "tcp")), 1)
+        self.assertEqual(self.read_report(output_csv)["egress"][0]["rule"], invalid_rule)
         with self.assertRaises(ValueError):
-            self.export([make_rule("ingress", "6")],
-                        [make_service_rule("egress", "all", " ")],
-                        output=output_csv, force=True)
-        self.assertEqual({path.name: path.read_bytes() for path in output_csv.iterdir()}, before_csv)
+            self.import_csv(output_csv)
+        self.assertFalse((self.work / "json").exists())
         directory = self.write_tables()
         output_json = self.work / "json"
         self.import_csv(directory)
@@ -364,11 +423,12 @@ class ConversionTests(unittest.TestCase):
             self.import_csv(directory, output=output_json, force=True)
         self.assertEqual({path.name: path.read_bytes() for path in output_json.iterdir()}, before_json)
 
-    def test_empty_rules_write_four_headers_and_two_empty_arrays(self):
+    def test_empty_rules_write_five_headers_complete_report_and_two_empty_arrays(self):
         directory = self.export()
-        for protocol, fields in CSV_TO_JSON.CSV_FIELDS.items():
+        for protocol, fields in JSON_TO_CSV.CSV_FIELDS.items():
             with (directory / f"{protocol}.csv").open(encoding="utf-8-sig", newline="") as stream:
                 self.assertEqual(list(csv.reader(stream)), [fields])
+        self.assert_complete_report(directory)
         self.assertEqual(self.import_csv(directory), {"ingress": [], "egress": []})
 
     def test_null_optional_values_and_integer_protocol(self):
@@ -558,13 +618,21 @@ class ConversionTests(unittest.TestCase):
                 oci_get=None, ingress=self.write_json("not-array.json", {}),
                 egress=self.write_json("array.json", [])))
 
-    def test_late_invalid_rule_does_not_write_or_modify_csv_outputs(self):
-        output = self.export()
-        before = {path.name: path.read_bytes() for path in output.iterdir()}
-        rules = [make_rule("egress", "6"), make_rule("egress", "58")]
+    def test_late_invalid_rule_is_reported_while_supported_rules_are_exported(self):
+        invalid = make_rule("egress", "58")
+        rules = [make_rule("egress", "6"), invalid, make_rule("egress", "17")]
+        output = self.export([make_rule("ingress", "6")], rules)
+        self.assertEqual(self.last_unconverted, 1)
+        self.assertEqual(len(self.read_table(output, "tcp")), 2)
+        self.assertEqual(len(self.read_table(output, "udp")), 1)
+        report = self.read_report(output)
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(report["egress"][0]["index"], 2)
+        self.assertEqual(report["egress"][0]["rule"], invalid)
+        self.assertTrue(report["egress"][0]["error"])
         with self.assertRaises(ValueError):
-            self.export([make_rule("ingress", "6")], rules, output=output, force=True)
-        self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, before)
+            self.import_csv(output)
+        self.assertFalse((self.work / "json").exists())
 
     def test_late_invalid_csv_does_not_modify_json_outputs(self):
         directory = self.write_tables()
@@ -628,13 +696,22 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, before)
         self.assert_no_temporary_files(output)
 
-    def test_csv_staging_encoding_failure_preserves_all_existing_outputs_and_cleans_temps(self):
+    def test_csv_staging_write_failure_preserves_all_existing_outputs_and_cleans_temps(self):
         output = self.export()
         before = {path.name: path.read_bytes() for path in output.iterdir()}
-        with self.assertRaises(UnicodeError):
-            self.export([make_rule("ingress", "6"),
-                         make_rule("ingress", "all", description="\ud800")],
-                        output=output, force=True)
+        original = JSON_TO_CSV.csv.DictWriter.writerows
+        calls = 0
+
+        def fail_second(writer, rows):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("simulated CSV staging failure")
+            return original(writer, rows)
+
+        with mock.patch.object(JSON_TO_CSV.csv.DictWriter, "writerows", new=fail_second):
+            with self.assertRaises(OSError):
+                self.export([make_rule("ingress", "6")], output=output, force=True)
         self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, before)
         self.assert_no_temporary_files(output)
 
@@ -674,6 +751,284 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 1)
         self.assertNotIn(b"Traceback", completed.stderr)
         self.assertFalse((self.work / "bad-output").exists())
+
+    def test_dedicated_service_csv_imports_all_protocols_without_duplicating_legacy_services(self):
+        tables = {"service": []}
+        expected = {"ingress": [], "egress": []}
+        for protocol, code in (("tcp", "6"), ("udp", "17"), ("icmp", "1"), ("all", "all")):
+            for direction in ("ingress", "egress"):
+                tables["service"].append(self.service_row(protocol, direction))
+                expected[direction].append(make_service_rule(direction, code))
+        self.assertEqual(self.import_csv(self.write_tables(tables)), expected)
+        legacy = self.row("tcp")
+        legacy.update(cidr="oci-legacy-example", address_type="SERVICE_CIDR_BLOCK")
+        directory = self.write_tables({"tcp": [legacy], "service": [self.service_row("tcp")]})
+        actual = self.import_csv(directory, output=self.work / "mixed-json")
+        self.assertEqual(actual["ingress"], [make_service_rule("ingress", "6", "oci-legacy-example"),
+                                             make_service_rule("ingress", "6")])
+
+    def test_service_csv_unused_columns_and_unknown_protocol_are_rejected_before_output(self):
+        cases = [("tcp", "type", "3"), ("tcp", "code", "4"),
+                 ("udp", "type", "8"), ("udp", "code", "0"),
+                 ("icmp", "dst_min", "all"), ("icmp", "dst_max", "443"),
+                 ("all", "dst_min", "all"), ("all", "dst_max", "all"),
+                 ("all", "type", "3"), ("all", "code", "4")]
+        for protocol, field, value in cases:
+            with self.subTest(protocol=protocol, field=field):
+                row = self.service_row(protocol, **{field: value})
+                with self.assertRaises(ValueError):
+                    self.import_csv(self.write_tables({"service": [row]}))
+                self.assertFalse((self.work / "json").exists())
+        for protocol in ("", "58", "6", "unknown"):
+            with self.subTest(protocol=protocol):
+                with self.assertRaises(ValueError):
+                    self.import_csv(self.write_tables({"service": [self.service_row(protocol)]}))
+                self.assertFalse((self.work / "json").exists())
+
+    def test_import_sorts_protocols_stably_after_separate_service_file(self):
+        tables = {"tcp": [self.row("tcp")], "all": [self.row("all")], "service": [
+            self.service_row("all", description="service all first"),
+            self.service_row("tcp", description="service tcp first"),
+            self.service_row("icmp"),
+            self.service_row("tcp", description="service tcp second"),
+        ]}
+        actual = self.import_csv(self.write_tables(tables))["ingress"]
+        self.assertEqual(actual, [make_rule("ingress", "6"),
+                                 make_service_rule("ingress", "6", description="service tcp first"),
+                                 make_service_rule("ingress", "6", description="service tcp second"),
+                                 make_service_rule("ingress", "1"), make_rule("ingress", "all"),
+                                 make_service_rule("ingress", "all", description="service all first")])
+
+    def test_partial_get_report_preserves_original_hyphenated_rules_and_indices(self):
+        invalid_ingress = hyphen_keys(make_service_rule("ingress", "6", tcpOptions={
+            "sourcePortRange": {"min": 443, "max": 443}}, description='未変換, "原文"\n2行目'))
+        invalid_egress = hyphen_keys(make_rule("egress", "58", description="ICMPv6未対応"))
+        raw_ingress = [hyphen_keys(make_rule("ingress", "6")), invalid_ingress, None,
+                       hyphen_keys(make_service_rule("ingress", "all"))]
+        get = self.write_json("partial-get.json", {"data": {
+            "ingress-security-rules": raw_ingress,
+            "egress-security-rules": [invalid_egress, hyphen_keys(make_rule("egress", "17"))]}})
+        output = self.export(get=get)
+        self.assertEqual(self.last_unconverted, 3)
+        report = self.read_report(output)
+        self.assertEqual(report["format_version"], 1)
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual([entry["index"] for entry in report["ingress"]], [2, 3])
+        self.assertEqual([entry["rule"] for entry in report["ingress"]], [invalid_ingress, None])
+        self.assertEqual(report["egress"][0]["rule"], invalid_egress)
+        self.assertEqual(report["egress"][0]["index"], 1)
+        self.assertTrue(all(entry["error"] for direction in ("ingress", "egress")
+                            for entry in report[direction]))
+        self.assertEqual(len(self.read_table(output, "tcp")), 1)
+        self.assertEqual(len(self.read_table(output, "udp")), 1)
+        self.assertEqual(len(self.read_table(output, "service")), 1)
+
+    def test_surrogate_description_is_partial_and_saved_without_losing_supported_rows(self):
+        bad = make_rule("ingress", "all", description="\ud800")
+        output = self.export([make_rule("ingress", "6"), bad])
+        self.assertEqual(self.last_unconverted, 1)
+        self.assertEqual(self.read_report(output)["ingress"][0]["rule"], bad)
+        self.assertEqual(len(self.read_table(output, "tcp")), 1)
+        self.assertEqual(self.read_table(output, "all"), [])
+
+    def test_force_complete_replaces_partial_report_and_removes_stale_service_rows(self):
+        output = self.export([make_service_rule("ingress", "6"), make_rule("ingress", "58")])
+        self.assertEqual(self.read_report(output)["status"], "partial")
+        self.assertEqual(len(self.read_table(output, "service")), 1)
+        self.export([make_rule("ingress", "17")], output=output, force=True)
+        self.assert_complete_report(output)
+        self.assertEqual(self.read_table(output, "service"), [])
+        self.assertEqual(self.read_table(output, "tcp"), [])
+        self.assertEqual(self.import_csv(output)["ingress"], [make_rule("ingress", "17")])
+
+    def test_existing_report_alone_requires_force_and_is_not_overwritten(self):
+        output = self.work / "csv"
+        output.mkdir()
+        report_path = output / "unconverted-rules.json"
+        report_path.write_text("sentinel", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.export(output=output)
+        self.assertEqual(report_path.read_text(), "sentinel")
+        self.assertEqual(list(output.glob("*.csv")), [])
+        self.export(output=output, force=True)
+        self.assert_complete_report(output)
+
+    def test_import_rejects_incomplete_failed_unknown_or_malformed_report_without_changing_json(self):
+        directory = self.write_tables({"tcp": [self.row("tcp")]})
+        self.import_csv(directory)
+        output = self.work / "json"
+        before = {path.name: path.read_bytes() for path in output.iterdir()}
+        complete = {"format_version": 1, "status": "complete", "ingress": [], "egress": []}
+        bad_reports = [[], {}, {**complete, "status": "partial"}, {**complete, "status": "failed"},
+                       {**complete, "status": "unknown"}, {**complete, "format_version": 2},
+                       {**complete, "format_version": True}, {**complete, "ingress": [None]},
+                       {**complete, "egress": {}}, {key: value for key, value in complete.items()
+                                                      if key != "status"}]
+        report_path = directory / "unconverted-rules.json"
+        for report in bad_reports:
+            with self.subTest(report=report):
+                report_path.write_text(json.dumps(report), encoding="utf-8")
+                with self.assertRaises(ValueError):
+                    self.import_csv(directory, output=output, force=True)
+                self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, before)
+        for raw in (b"{", b"\xff", b'{"format_version":1,"format_version":2}'):
+            with self.subTest(raw=raw):
+                report_path.write_bytes(raw)
+                with self.assertRaises(ValueError):
+                    self.import_csv(directory, output=output, force=True)
+                self.assertEqual({path.name: path.read_bytes() for path in output.iterdir()}, before)
+        report_path.write_text(json.dumps(complete), encoding="utf-8")
+        self.assertEqual(self.import_csv(directory, output=output, force=True)["ingress"],
+                         [make_rule("ingress", "6")])
+
+    def test_fatal_cli_malformed_json_saves_input_text_and_does_not_create_csv(self):
+        path = self.work / "broken-get.json"
+        text = '{"data": {"description": "文書用の原文"\n'
+        path.write_bytes(text.encode("utf-8"))
+        completed, output = self.run_json_cli(["--oci-get", str(path)])
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertNotIn(b"Traceback", completed.stderr)
+        self.assertEqual(list(output.glob("*.csv")), [])
+        report = self.read_report(output)
+        self.assertEqual(report["format_version"], 1)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual((report["ingress"], report["egress"]), ([], []))
+        self.assertTrue(report["error"])
+        self.assertEqual(report["inputs"], [{"argument": "--oci-get", "file": path.name, "text": text}])
+
+    def test_fatal_cli_invalid_utf8_saves_recoverable_base64(self):
+        path = self.work / "non-utf8.json"
+        raw = b'{"synthetic":"\xff\xfe"}'
+        path.write_bytes(raw)
+        completed, output = self.run_json_cli(["--oci-get", str(path)])
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        report = self.read_report(output)
+        self.assertEqual(report["status"], "failed")
+        saved = report["inputs"][0]
+        self.assertEqual(saved["argument"], "--oci-get")
+        self.assertEqual(saved["file"], path.name)
+        self.assertEqual(base64.b64decode(saved["base64"], validate=True), raw)
+        self.assertNotIn("text", saved)
+        self.assertEqual(list(output.glob("*.csv")), [])
+
+    def test_overflow_json_number_cannot_publish_invalid_json_report_or_partial_csv(self):
+        ingress = self.work / "overflow-ingress.json"
+        text = '[{"protocol":"6","source":"192.0.2.0/24"},' \
+               '{"protocol":"58","source":"192.0.2.0/24","synthetic-number":1e309}]'
+        ingress.write_bytes(text.encode("utf-8"))
+        egress = self.write_json("overflow-egress.json", [])
+        completed, output = self.run_json_cli(["--ingress", str(ingress), "--egress", str(egress)])
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        report_text = (output / "unconverted-rules.json").read_text(encoding="utf-8")
+        self.assertNotIn("Infinity", report_text)
+        report = self.read_report(output)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["inputs"][0]["text"], text)
+        self.assertEqual(list(output.glob("*.csv")), [])
+        self.assert_no_temporary_files(output)
+
+    def test_fatal_cli_missing_file_records_read_error_and_original_filename(self):
+        missing = self.work / "missing-input.json"
+        completed, output = self.run_json_cli(["--oci-get", str(missing)])
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        report = self.read_report(output)
+        self.assertEqual(report["status"], "failed")
+        saved = report["inputs"][0]
+        self.assertEqual(saved["file"], missing.name)
+        self.assertTrue(saved["read_error"])
+        self.assertNotIn("text", saved)
+        self.assertEqual(list(output.glob("*.csv")), [])
+
+    def test_fatal_cli_argument_error_writes_failed_report_without_a_traceback(self):
+        completed, output = self.run_json_cli(["--unknown-test-option"])
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertNotIn(b"Traceback", completed.stderr)
+        report = self.read_report(output)
+        self.assertEqual(report["status"], "failed")
+        self.assertTrue(report["error"])
+        self.assertEqual(report["inputs"], [])
+        self.assertEqual(list(output.glob("*.csv")), [])
+
+    def test_normalized_duplicate_keys_in_one_get_rule_are_partial_and_raw_is_retained(self):
+        bad = hyphen_keys(make_service_rule("ingress", "6"))
+        bad["isStateless"] = True
+        get = self.write_json("duplicate-rule-get.json", {"data": {
+            "ingress-security-rules": [bad, hyphen_keys(make_rule("ingress", "17"))],
+            "egress-security-rules": []}})
+        output = self.export(get=get)
+        self.assertEqual(self.last_unconverted, 1)
+        report = self.read_report(output)
+        self.assertEqual(report["status"], "partial")
+        self.assertEqual(report["ingress"][0]["rule"], bad)
+        self.assertIn("重複", report["ingress"][0]["error"])
+        self.assertEqual(len(self.read_table(output, "udp")), 1)
+
+    def test_dedicated_service_csv_rejects_extra_address_type_header(self):
+        directory = self.write_tables()
+        row = self.service_row("tcp", address_type="CIDR_BLOCK")
+        with (directory / "service.csv").open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=list(row))
+            writer.writeheader()
+            writer.writerow(row)
+        with self.assertRaises(ValueError):
+            self.import_csv(directory)
+        self.assertFalse((self.work / "json").exists())
+
+    def test_fatal_cli_wrong_input_shape_saves_both_original_array_documents(self):
+        ingress = self.write_json("wrong-shape.json", {"documentation": "not an array"})
+        egress = self.write_json("valid-empty-array.json", [])
+        completed, output = self.run_json_cli(["--ingress", str(ingress), "--egress", str(egress)])
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        report = self.read_report(output)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual([item["argument"] for item in report["inputs"]], ["--ingress", "--egress"])
+        self.assertEqual([item["text"] for item in report["inputs"]],
+                         [path.read_text(encoding="utf-8") for path in (ingress, egress)])
+        self.assertEqual(list(output.glob("*.csv")), [])
+
+    def test_partial_cli_returns_one_and_csv_import_cli_refuses_incomplete_subset(self):
+        ingress = self.write_json("partial-ingress.json", [make_service_rule("ingress", "6"),
+                                                          make_rule("ingress", "58")])
+        egress = self.write_json("partial-egress.json", [make_rule("egress", "17")])
+        completed, output = self.run_json_cli(["--ingress", str(ingress), "--egress", str(egress)])
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertEqual(self.read_report(output)["status"], "partial")
+        self.assertEqual(len(self.read_table(output, "service")), 1)
+        target = self.work / "guarded-json"
+        result = subprocess.run([sys.executable, str(ROOT / "oci_security_list_csv_to_json.py"),
+                                 "--input-dir", str(output), "--output-dir", str(target)], capture_output=True)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse(target.exists())
+        ingress.write_text("[]", encoding="utf-8")
+        completed, output = self.run_json_cli(["--ingress", str(ingress), "--egress", str(egress)],
+                                              output=output, force=True)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.read_report(output)["status"], "complete")
+        self.assertEqual(self.read_table(output, "service"), [])
+
+    def test_failed_report_after_force_protects_old_csv_from_import(self):
+        output = self.export([make_rule("ingress", "6")])
+        before = {path.name: path.read_bytes() for path in output.glob("*.csv")}
+        bad = self.work / "failed-get.json"
+        bad.write_text("{", encoding="utf-8")
+        completed, output = self.run_json_cli(["--oci-get", str(bad)], output=output, force=True)
+        self.assertEqual(completed.returncode, 1, completed.stderr)
+        self.assertEqual({path.name: path.read_bytes() for path in output.glob("*.csv")}, before)
+        self.assertEqual(self.read_report(output)["status"], "failed")
+        with self.assertRaises(ValueError):
+            self.import_csv(output)
+        self.assertFalse((self.work / "json").exists())
+
+    def test_public_examples_arrays_get_and_five_csvs_have_identical_rule_meanings(self):
+        expected = {direction: json.loads((ROOT / "examples/json" / f"{direction}.json").read_text(encoding="utf-8-sig"))
+                    for direction in ("ingress", "egress")}
+        from_get = self.export(get=ROOT / "examples/oci-get.json")
+        self.assert_complete_report(from_get)
+        self.assertEqual(self.import_csv(from_get), expected)
+        self.assertEqual(self.import_csv(ROOT / "examples/csv", output=self.work / "example-json"), expected)
+        self.assertEqual(len(self.read_table(from_get, "service")), 2)
+        self.assertEqual(sum(len(self.read_table(from_get, name))
+                             for name in ("tcp", "udp", "icmp", "all", "service")), 12)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OCI Security List JSON -> tcp/udp/icmp/all CSV converter.
+"""OCI Security List JSON -> protocol CSVs plus a dedicated service.csv.
 
 Supports:
   - CLI rule arrays: --ingress ingress.json --egress egress.json
@@ -7,10 +7,12 @@ Supports:
 
 Requires Python 3.9+ and no external packages.
 The output schema is compatible with the previously shown CSV -> JSON generator.
-Unsupported OCI features fail explicitly to prevent silent rule loss.
+Unconverted rules are preserved in unconverted-rules.json; partial conversion
+returns a nonzero CLI status. No OCI API calls are made.
 """
 
 import argparse
+import base64
 import csv
 import ipaddress
 import json
@@ -25,7 +27,10 @@ CSV_FIELDS = {
     "udp": ["direction", "cidr", "address_type", "dst_min", "dst_max", "stateless", "description"],
     "icmp": ["direction", "cidr", "address_type", "type", "code", "stateless", "description"],
     "all": ["direction", "cidr", "address_type", "stateless", "description"],
+    "service": ["direction", "cidr", "protocol", "dst_min", "dst_max", "type", "code",
+                "stateless", "description"],
 }
+REPORT_FILENAME = "unconverted-rules.json"
 PROTOCOL_TO_CSV = {"6": "tcp", "17": "udp", "1": "icmp", "all": "all"}
 COMMON_FIELDS = {
     "protocol", "isStateless", "description", "tcpOptions", "udpOptions", "icmpOptions"
@@ -60,16 +65,16 @@ def camel_key(key):
     return re.sub(r"-([a-z])", lambda match: match.group(1).upper(), key)
 
 
-def normalize_keys(value):
+def normalize_keys(value, recursive=True):
     if isinstance(value, dict):
         result = {}
         for key, item in value.items():
             normalized = camel_key(key)
             if normalized in result:
                 die(f"同じキーが重複しています: {key} / {normalized}")
-            result[normalized] = normalize_keys(item)
+            result[normalized] = normalize_keys(item) if recursive else item
         return result
-    if isinstance(value, list):
+    if isinstance(value, list) and recursive:
         return [normalize_keys(item) for item in value]
     return value
 
@@ -189,6 +194,16 @@ def convert_rule(raw, direction, index):
             code = options.get("code")
             csv_row["code"] = "" if code is None else integer(code, f"{where}: ICMP code", 0, 255)
 
+    # Validate UTF-8 here so an unrepresentable value is kept with its original
+    # rule in the report instead of preventing other rules from being exported.
+    address.encode("utf-8")
+    description.encode("utf-8")
+    if addr_type == "SERVICE_CIDR_BLOCK":
+        del csv_row["address_type"]
+        csv_row["protocol"] = name
+        for unused in ("dst_min", "dst_max", "type", "code"):
+            csv_row.setdefault(unused, "")
+        return "service", csv_row
     return name, csv_row
 
 
@@ -202,7 +217,9 @@ def read_inputs(args):
         content = loaded.get("data", loaded)
         if not isinstance(content, dict):
             die("get出力のdataはオブジェクトが必要です")
-        content = normalize_keys(content)
+        # Preserve rules exactly as loaded, including CLI hyphenated keys.
+        # Rule-key normalization and errors belong to convert_rule().
+        content = normalize_keys(content, recursive=False)
         if "ingressSecurityRules" not in content or "egressSecurityRules" not in content:
             die("get出力にingress-security-rules/egress-security-rulesがありません")
         ingress = content["ingressSecurityRules"]
@@ -220,13 +237,22 @@ def read_inputs(args):
 def export_csv(args):
     ingress, egress = read_inputs(args)
     tables = {name: [] for name in CSV_FIELDS}
+    report = {"format_version": 1, "status": "complete", "ingress": [], "egress": []}
     for direction, entries in (("ingress", ingress), ("egress", egress)):
         for index, item in enumerate(entries, start=1):
-            name, converted = convert_rule(item, direction, index)
-            tables[name].append(converted)
+            try:
+                name, converted = convert_rule(item, direction, index)
+            except ValueError as exc:
+                report[direction].append({"index": index, "error": str(exc), "rule": item})
+            else:
+                tables[name].append(converted)
+    unconverted_count = len(report["ingress"]) + len(report["egress"])
+    if unconverted_count:
+        report["status"] = "partial"
 
     output_dir = args.output_dir
     paths = {name: output_dir / f"{name}.csv" for name in CSV_FIELDS}
+    paths["report"] = output_dir / REPORT_FILENAME
     existing = [str(path) for path in paths.values() if path.exists()]
     if existing and not args.force:
         die("上書きを防止しました。次のファイルが存在します。\n  " + "\n  ".join(existing)
@@ -235,8 +261,8 @@ def export_csv(args):
         die(f"出力先がディレクトリではありません: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Prepare every CSV before publishing any output. Publication is per file,
-    # not an atomic transaction across all four files.
+    # Prepare all five CSVs and the report before publishing any output.
+    # Publication is per file, not an atomic transaction across all six files.
     staged = {}
     try:
         for name, fields in CSV_FIELDS.items():
@@ -247,33 +273,108 @@ def export_csv(args):
                 writer = csv.DictWriter(temp, fieldnames=fields, lineterminator="\n")
                 writer.writeheader()
                 writer.writerows(tables[name])
-        for name in CSV_FIELDS:
-            if args.force:
-                os.replace(staged[name], paths[name])
-            elif os.name == "nt":
-                os.rename(staged[name], paths[name])
-            else:
-                os.link(staged[name], paths[name])
-            print(f"{paths[name]}: {len(tables[name])}件")
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n",
+                                         dir=output_dir, suffix=".tmp", delete=False) as temp:
+            staged["report"] = Path(temp.name)
+            # Escaping preserves even invalid Unicode from unconverted rules.
+            json.dump(report, temp, ensure_ascii=True, indent=2, allow_nan=False)
+            temp.write("\n")
+        for name in paths:
+            publish_file(staged[name], paths[name], args.force)
+            if name != "report":
+                print(f"{paths[name]}: {len(tables[name])}件")
+        print(f"{paths['report']}: 未変換{unconverted_count}件")
     finally:
         for temp_path in staged.values():
             temp_path.unlink(missing_ok=True)
+    return unconverted_count
+
+
+def publish_file(staged, destination, force):
+    if force:
+        os.replace(staged, destination)
+    elif os.name == "nt":
+        os.rename(staged, destination)
+    else:
+        os.link(staged, destination)
+
+
+def capture_inputs(args):
+    """Retain failed input files without adding their absolute paths to metadata."""
+    inputs = []
+    for name in ("oci_get", "ingress", "egress"):
+        path = getattr(args, name, None)
+        if path is None:
+            continue
+        item = {"argument": "--" + name.replace("_", "-"), "file": path.name}
+        try:
+            content = path.read_bytes()
+        except OSError as exc:
+            item["read_error"] = str(exc)
+        else:
+            try:
+                item["text"] = content.decode("utf-8")
+            except UnicodeError:
+                item["base64"] = base64.b64encode(content).decode("ascii")
+        inputs.append(item)
+    return inputs
+
+
+def save_failed_report(args, error):
+    report = {"format_version": 1, "status": "failed", "ingress": [], "egress": [],
+              "error": str(error), "inputs": capture_inputs(args)}
+    output_dir = args.output_dir
+    destination = output_dir / REPORT_FILENAME
+    if destination.exists() and not args.force:
+        die(f"既存レポートを上書きしません: {destination}（上書き時は--forceを指定）")
+    if output_dir.exists() and not output_dir.is_dir():
+        die(f"出力先がディレクトリではありません: {output_dir}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n",
+                                         dir=output_dir, suffix=".tmp", delete=False) as temp:
+            staged = Path(temp.name)
+            json.dump(report, temp, ensure_ascii=True, indent=2, allow_nan=False)
+            temp.write("\n")
+        publish_file(staged, destination, args.force)
+    finally:
+        if staged is not None:
+            staged.unlink(missing_ok=True)
+    return destination
+
+
+class ReportArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        # Let main preserve malformed CLI inputs in the same failure report.
+        raise ValueError(message)
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="OCIセキュリティリストのJSONをtcp/udp/icmp/allのCSVへ逆変換します。OCIへの変更は行いません。"
+    parser = ReportArgumentParser(
+        description="OCIセキュリティリストJSONを4種のCSVとservice.csvへ変換し、未変換ルールをJSONに保存します。OCIへの変更は行いません。"
     )
     parser.add_argument("--ingress", type=Path, help="ingress.json（JSON配列）")
     parser.add_argument("--egress", type=Path, help="egress.json（JSON配列）")
     parser.add_argument("--oci-get", type=Path, help="oci network security-list get のJSON出力")
     parser.add_argument("--output-dir", type=Path, default=Path("csv_export"), help="CSV出力先（既定: csv_export）")
-    parser.add_argument("--force", action="store_true", help="既存CSVファイルを上書き")
-    args = parser.parse_args()
+    parser.add_argument("--force", action="store_true", help="既存CSVとレポートを上書き")
+    args = argparse.Namespace()
     try:
-        export_csv(args)
+        parser.parse_args(namespace=args)
+        unconverted_count = export_csv(args)
     except (ValueError, OSError, csv.Error) as exc:
         print(f"エラー: {exc}", file=sys.stderr)
+        try:
+            destination = save_failed_report(args, exc)
+        except (ValueError, OSError, csv.Error) as report_error:
+            print(f"失敗した入力をJSONに保存できませんでした: {report_error}", file=sys.stderr)
+        else:
+            print(f"失敗した入力を保存しました: {destination}", file=sys.stderr)
+        return 1
+    if unconverted_count:
+        print(f"未変換ルールが{unconverted_count}件あります。原文と理由を保存しました: "
+              f"{args.output_dir / REPORT_FILENAME}", file=sys.stderr)
         return 1
     return 0
 

@@ -1,6 +1,6 @@
 # OCIセキュリティ・リスト CSV ⇔ JSON変換ツール
 
-OCIセキュリティ・リストのIngress/Egressルールを、編集しやすい4種類のCSVとOCI CLI入力用JSON配列の間で変換するPythonスクリプトです。通常のCIDR（`CIDR_BLOCK`）とサービスCIDR（`SERVICE_CIDR_BLOCK`）の両方を扱い、`oci network security-list get`で取得した標準JSONからCSVへの変換にも対応します。
+OCIセキュリティ・リストのIngress/Egressルールを、編集しやすいCSVとOCI CLI入力用JSON配列の間で変換するPythonスクリプトです。通常のCIDR（`CIDR_BLOCK`）はプロトコル別の4枚、サービスCIDR（`SERVICE_CIDR_BLOCK`）は専用の`service.csv`に出力します。`oci network security-list get`で取得した標準JSONからCSVへの変換にも対応します。CSVに変換できないルールは、CSV出力先と同じフォルダの`unconverted-rules.json`に原文と理由を保存します。
 
 変換スクリプト自体はOCI APIを呼び出しません。生成したJSONをOCIに適用する操作は、利用者が内容を確認した後に別途実行します。
 
@@ -14,9 +14,10 @@ OCIセキュリティ・リストのIngress/Egressルールを、編集しやす
 
 ```text
 oci_security_list_csv_to_json.py  CSV → ingress.json / egress.json
-oci_security_list_json_to_csv.py JSON → tcp.csv / udp.csv / icmp.csv / all.csv
+oci_security_list_json_to_csv.py JSON → tcp.csv / udp.csv / icmp.csv / all.csv / service.csv
+                                     + unconverted-rules.json（結果・未変換ルール）
 examples/
-  csv/                          4種類の合成CSV例
+  csv/                          プロトコル別4枚とサービス専用CSVの合成例
   json/                         OCI CLI入力用Ingress/Egress配列の合成例
   oci-get.json                  dataラッパー・ハイフン区切りキーの合成例
 ```
@@ -46,9 +47,9 @@ python oci_security_list_json_to_csv.py --oci-get examples/oci-get.json --output
 python oci_security_list_csv_to_json.py --input-dir local-data/roundtrip-csv --output-dir local-data/roundtrip-json
 ```
 
-各コマンドの終了コードが0であることを確認してください。不正な入力や未対応のルールは終了コード1で停止します。再実行で既存の出力ファイルを上書きする場合のみ、それぞれのコマンドに`--force`を追加します。
+各コマンドの終了コードが0であることを確認してください。JSON → CSVで未対応・不正なルールがある場合は、変換できるルールのCSVと未変換JSONを保存したうえで終了コード1を返します。CSV → JSONは不正なCSVや未解決の未変換JSONがあれば停止します。再実行で既存の出力ファイルを上書きする場合のみ、それぞれのコマンドに`--force`を追加します。
 
-JSON → CSV → JSONの往復では、対応範囲のルールの意味と説明文を保持します。ただし、ルールはTCP、UDP、ICMP、ALLの順にまとまるため、元JSONの配列順は変わる場合があります。省略可能なキー・`null`・CIDRの表記も整理されるため、元のJSONとのバイト単位の一致は保証しません。空の説明文と未設定の説明文は区別しません。
+JSON → CSV → JSONの往復では、対応範囲のルールの意味と説明文を保持します。ただし、ルールはTCP、UDP、ICMP、ALLの順にまとまり、同じプロトコルでは従来4CSVの行、`service.csv`の行の順になるため、元JSONの配列順は変わる場合があります。省略可能なキー・`null`・CIDRの表記も整理されるため、元のJSONとのバイト単位の一致は保証しません。空の説明文と未設定の説明文は区別しません。
 
 ## 実環境のget出力を保存して変換する
 
@@ -101,11 +102,11 @@ if ($LASTEXITCODE -ne 0) {
 
 `--oci-get`は標準レスポンスの`data`ラッパー付きJSONと、`--query data`で取り出したルールを含むオブジェクトの両方を受け付けます。キーはハイフン区切り・camelCaseのどちらも扱います。`--oci-get`と`--ingress`/`--egress`は同時指定できません。配列入力の場合は`--ingress`と`--egress`の両方を指定します。
 
-get出力のリソースOCID、コンパートメントOCID、表示名、タグ、ETagなどのメタデータはCSV・生成JSONに出力しません。ルール内のCIDRと説明文は保持するため、変換は機密情報の匿名化を目的とした処理ではありません。
+正常変換時、get出力のリソースOCID、コンパートメントOCID、表示名、タグ、ETagなどのメタデータはCSV・生成JSONに出力しません。ルール内のCIDRと説明文は保持するため、変換は機密情報の匿名化を目的とした処理ではありません。入力全体の変換に失敗した場合のJSONレポートには、入力ファイルの内容を保管するため、メタデータも含まれる可能性があります。
 
 ## CSVの形式
 
-CSV → JSONでは、入力ディレクトリに4枚のCSVがすべて必要です。あるプロトコルのルールがない場合は、そのCSVをヘッダー行だけにします。`address_type`以外の列の不足・余分な列・重複列はエラーになります。
+CSV → JSONでは、入力ディレクトリにプロトコル別の4枚のCSVがすべて必要です。あるプロトコルのルールがない場合は、そのCSVをヘッダー行だけにします。`service.csv`は任意で、存在する場合は追加で読み込みます。従来4枚では`address_type`以外の列の不足・余分な列・重複列はエラーです。`service.csv`では下表の全列が必要です。
 
 | ファイル | ヘッダー |
 | --- | --- |
@@ -113,14 +114,16 @@ CSV → JSONでは、入力ディレクトリに4枚のCSVがすべて必要で�
 | `udp.csv` | `direction,cidr,address_type,dst_min,dst_max,stateless,description` |
 | `icmp.csv` | `direction,cidr,address_type,type,code,stateless,description` |
 | `all.csv` | `direction,cidr,address_type,stateless,description` |
+| `service.csv` | `direction,cidr,protocol,dst_min,dst_max,type,code,stateless,description` |
 
-JSON → CSVは常に`address_type`列を出力します。CSV → JSONは、この列がない旧形式のCSVも受け付けます。列がない場合・値が空欄の場合は`CIDR_BLOCK`として扱います。新しいCSVを読み込む際は、CSV → JSONスクリプトも本リポジトリの最新版を使用してください。
+JSON → CSVは常に5枚のCSVを出力し、該当ルールがないCSVはヘッダー行のみになります。従来4枚のCSVは`address_type`列を出力します。CSV → JSONは、この列がない旧形式の4CSVも受け付け、列がない場合・値が空欄の場合は`CIDR_BLOCK`として扱います。従来4CSVに`SERVICE_CIDR_BLOCK`を指定する前の版の形式も引き続き読み込めます。`service.csv`には`address_type`列を設けず、全行を`SERVICE_CIDR_BLOCK`として扱います。新しいCSVを読み込む際は、両スクリプトを最新版に更新してください。同じルールを従来4CSVと`service.csv`の両方に書くと二重に取り込まれるため、どちらか一方に記載してください。
 
 | 列 | 指定方法 |
 | --- | --- |
 | `direction` | `ingress`または`egress`。Ingressでは`cidr`を`source`、Egressでは`destination`に変換します。 |
 | `cidr` | `CIDR_BLOCK`では有効なIPv4/IPv6ネットワークのCIDR。ホストビットが立った値はエラーです。例：`192.0.2.1/24`ではなく`192.0.2.0/24`。`SERVICE_CIDR_BLOCK`ではサービスCIDRラベル文字列。 |
 | `address_type` | `CIDR_BLOCK`または`SERVICE_CIDR_BLOCK`。Ingressの`sourceType`、Egressの`destinationType`に対応します。前後の空白を除いて大文字の値を指定します。空欄・列省略は`CIDR_BLOCK`。未知の種別はエラーです。 |
+| `protocol` | `service.csv`専用。`tcp`、`udp`、`icmp`、`all`のいずれか。 |
 | `dst_min`,`dst_max` | このツールでは1～65535の整数、かつ`dst_min <= dst_max`。単一ポートは同じ値を指定します。両列を`all`にすると宛先全ポートです。空欄や片方だけの`all`はエラーです。 |
 | `type`,`code` | IPv4 ICMPの0～255の整数。タイプを指定してコードを空欄にすると、そのタイプの全コード。両方空欄にすると全ICMPタイプ・コード。コードだけの指定はエラーです。 |
 | `stateless` | `true`または`false`。`false`はステートフルです。 |
@@ -130,13 +133,13 @@ JSON → CSVは常に`address_type`列を出力します。CSV → JSONは、こ
 
 入力CSV・JSONはUTF-8（BOMの有無はどちらも可）です。JSON → CSVの出力はUTF-8 BOM付きで、CSV → JSONの出力はUTF-8です。カンマ・引用符・改行を含む説明文は、通常のCSV規則に従って引用します。`examples/csv/icmp.csv`に改行を含む説明の例があります。
 
-### サービスCIDRを指定する
+### サービス専用CSVを指定する
 
-`cidr`列には`Service.cidrBlock`の値を指定します。サービスのOCIDやコンソールの表示名ではありません。たとえば次のTCP Egress行は、宛先サービスラベルと宛先ポート443を保持します。
+`service.csv`の`cidr`列には`Service.cidrBlock`の値を指定します。サービスのOCIDやコンソールの表示名ではありません。たとえば次のTCP Egress行は、宛先サービスラベルと宛先ポート443を保持します。
 
 ```csv
-direction,cidr,address_type,dst_min,dst_max,stateless,description
-egress,all-phx-services-in-oracle-services-network,SERVICE_CIDR_BLOCK,443,443,false,公開サービスラベルを使った形式例
+direction,cidr,protocol,dst_min,dst_max,type,code,stateless,description
+egress,all-phx-services-in-oracle-services-network,tcp,443,443,,,false,公開サービスラベルを使った形式例
 ```
 
 この例のラベルはPHXリージョンの公開例です。そのまま別リージョンに適用せず、利用するリージョンで取得したサービス一覧の`cidr-block`を使用してください。取得例（リージョンは利用環境に合わせて変更）：
@@ -145,9 +148,29 @@ egress,all-phx-services-in-oracle-services-network,SERVICE_CIDR_BLOCK,443,443,fa
 oci network service list --all --region ap-tokyo-1 --output json
 ```
 
-JSON → CSVでは`sourceType`/`destinationType`（get形式では`source-type`/`destination-type`）とラベルを保持し、CSV → JSONでは対応する種別とラベルに戻します。IP CIDRとサービスCIDRは、同じCSV内で混在できます。`examples/csv/tcp.csv`、`examples/json/ingress.json`、`examples/json/egress.json`、`examples/oci-get.json`に両方向のサービスCIDR形式例があります。
+`service.csv`はTCP/UDP行で`type`・`code`を空欄、ICMP行で`dst_min`・`dst_max`を空欄、ALL行ですべてのポート・ICMP列を空欄にします。使用しない列に値がある場合はCSV → JSONでエラーにします。
+
+JSON → CSVでは`sourceType`/`destinationType`（get形式では`source-type`/`destination-type`）が`SERVICE_CIDR_BLOCK`のルールを`service.csv`だけに出力し、従来4CSVには重複出力しません。CSV → JSONではサービス種別とラベルに戻します。`examples/csv/service.csv`、`examples/json/ingress.json`、`examples/json/egress.json`、`examples/oci-get.json`に両方向のサービスCIDR形式例があります。
 
 サービスCIDRラベルはIP CIDRとして解析せず、空・空白のみの値を拒否し、それ以外の文字列は変更せず保持します。ラベルが実在するか、対象リージョンで利用できるか、通信要件・経路・サービスとの対応が正しいかは、このローカル変換では確認しません。不要な空白なども利用者が確認してください。サービスCIDRルールの変換成功は、Oracleサービスからの新規接続や通信全体の成立を保証しません。
+
+## 変換できないルールのJSON保存
+
+JSON → CSVは、CSVと同じ出力フォルダにUTF-8の`unconverted-rules.json`を出力します。
+
+| `status` | 出力内容 | 終了コード |
+| --- | --- | --- |
+| `complete` | 5枚のCSVと、未変換配列が空のJSONレポート | 0 |
+| `partial` | 変換できたルールの5枚のCSVと、未変換ルールを含むJSONレポート | 1 |
+| `failed` | 入力読込・JSON構文・入力全体の形式や書込みの失敗を記録したJSONレポート。入力確認時点の失敗ではCSVを作成しません | 1 |
+
+未対応プロトコル・送信元ポート制限・未知のアドレス種別・不正なルールなどは、方向別の`ingress`/`egress`配列に`index`（元の方向別配列内の1始まり位置）、`error`（理由）、`rule`（元のルール）を保存します。get形式のハイフン区切りキーや未対応項目も保持し、対応できる他のルールの変換は続けます。入力全体を解析できない場合は、`error`と`inputs`に入力ファイル名・元テキストを保存します。UTF-8で読めない入力はBase64で保存し、ファイル自体を読み出せない場合は読込エラーを記録します。出力先へ書き込めない場合はJSON保存もできないため、標準エラーに理由を表示します。
+
+`unconverted-rules.json`はOCI CLIへ渡すルール配列ではなく、未変換内容の保管・確認用です。CSV → JSONはこのファイルが存在する場合、`format_version`が1、`status`が`complete`、両方向の未変換配列が空の場合にだけ進みます。`partial`・`failed`や不正なレポートがあれば、不完全なルール配列の生成を防ぐため停止します。レポートがない従来CSVは引き続き読み込めます。
+
+未変換ルールを確認し、元の入力や変換対応・適用方法を解決してから再変換してください。レポートを削除するだけで一部のCSVを全ルールとして反映すると、既存ルールを失う可能性があります。既存の出力を更新する場合は`--force`を指定します。成功した再変換は空の`complete`レポートで以前の未変換情報も更新するため、古い失敗レポートを残しません。入力確認時点や一時書込み中の失敗では既存CSVを更新せず、同じフォルダの失敗レポートによりCSV → JSONは停止します。出力確定中の障害ではCSVの一部が更新済みの場合があるため、出力一式を確認し、別の空フォルダで再実行してください。
+
+レポートには実環境のルールや元入力が含まれるため、取得JSONと同様に公開しないでください。`unconverted-rules.json`は`.gitignore`の対象です。
 
 ## 対応範囲と制限
 
@@ -155,7 +178,7 @@ JSON → CSVでは`sourceType`/`destinationType`（get形式では`source-type`/
 - TCP/UDP/ALLはIPv4・IPv6 CIDRに対応します。ICMPv6（58）は未対応です。
 - アドレス種別は`CIDR_BLOCK`と`SERVICE_CIDR_BLOCK`に両方向で対応します。サービスCIDRもTCP/UDP/IPv4 ICMP/ALLの形式を変換できます。サービスラベルの実在確認やIP範囲への展開は行いません。
 - TCP/UDPは宛先ポート範囲だけを扱います。送信元ポート制限（`sourcePortRange`）を含むルールは未対応です。
-- その他の数値プロトコルやCSVで表現できない項目を含むルールは、黙って落とさず明示的なエラーにします。
+- その他の数値プロトコルやCSVで表現できない項目を含むルールは、JSON → CSVでは未変換JSONに保存します。CSV → JSONでは未解決のレポートがあれば停止します。
 - ポート1～65535はこのツールの対応範囲です。ポート0をOCI自体が受け付けないと断定するものではありません。
 - NSGのJSON、複数リソースの`list`出力、Terraformの構成ファイルは対象外です。
 
@@ -199,9 +222,9 @@ ETag不一致の場合は対象が変更されています。再取得して内�
 python -m unittest discover -s tests -v
 ```
 
-38件の自動テストで、両方向・4種類のプロトコル・get形式・説明文の往復、サービスCIDRの保持、IP CIDRとの混在、旧CSVとの互換性、未知のアドレス種別と空サービスラベルの検出、不正なCSV/JSON、重複キー、上書き防止、出力準備中の失敗時の既存ファイル保護を確認しています。Windows/Python 3.13で成功しました。Python 3.9以上向けに実装していますが、全バージョン・全OSでの実行試験は行っていません。
+57件の自動テストで、両方向・4種類のプロトコル・get形式・説明文の往復、サービス専用CSV、IP CIDRとの分離、旧CSVとの互換性、未変換JSONの原文保持、入力全体の失敗保存、不正レポートの検出、上書き防止、出力準備中の失敗時の既存ファイル保護を確認しています。Windows/Python 3.13で成功しました。Python 3.9以上向けに実装していますが、全バージョン・全OSでの実行試験は行っていません。
 
-出力はすべてのファイルを一時書込みしてから、1ファイルずつ確定します。複数ファイル全体を一括で更新する保証はありません。出力の確定中にディスク障害などが発生した場合は、別の空ディレクトリで再実行し、出力一式を確認してください。Windows以外では、`--force`なしの出力にハードリンクを使うため、対応するファイルシステム上の保存先を使用してください。
+出力はすべてのファイルを一時書込みしてから、1ファイルずつ確定します。複数ファイル全体を一括で更新する保証はありません。レポートだけで出力一式の完全性を保証するものではありません。出力の確定中にディスク障害などが発生した場合は、別の空ディレクトリで再実行し、出力一式を確認してください。Windows以外では、`--force`なしの出力にハードリンクを使うため、対応するファイルシステム上の保存先を使用してください。
 
 ## ExcelなどでCSVを開く場合
 

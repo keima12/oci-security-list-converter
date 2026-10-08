@@ -7,6 +7,7 @@
 /security-list.json
 /source.json
 /backup*.json
+unconverted-rules.json
 
 # Credentials and local configuration
 .oci/

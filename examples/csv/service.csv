@@ -1,0 +1,3 @@
+direction,cidr,protocol,dst_min,dst_max,type,code,stateless,description
+ingress,oci-phx-objectstorage,tcp,443,443,,,false,公開サービスラベルを使ったIngress形式例
+egress,all-phx-services-in-oracle-services-network,tcp,443,443,,,false,公開サービスラベルを使ったEgress形式例

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Convert tcp/udp/icmp/all CSV files into OCI Security List rule JSON arrays.
+"""Convert four protocol CSVs and optional service.csv into OCI rule JSON arrays.
 
 The `description` column is preserved as Unicode text without stripping spaces,
 including commas, double quotes and embedded newlines. No OCI API calls are made.
+An incomplete JSON-to-CSV report blocks generation of replacement rule arrays.
 Python 3.9+; only standard library modules are used.
 """
 import argparse
@@ -21,7 +22,10 @@ CSV_FIELDS = {
     "icmp": ["direction", "cidr", "address_type", "type", "code", "stateless", "description"],
     "all": ["direction", "cidr", "address_type", "stateless", "description"],
 }
+SERVICE_FIELDS = ["direction", "cidr", "protocol", "dst_min", "dst_max",
+                  "type", "code", "stateless", "description"]
 PROTOCOLS = {"tcp": "6", "udp": "17", "icmp": "1", "all": "all"}
+PROTOCOL_ORDER = {code: index for index, code in enumerate(PROTOCOLS.values())}
 
 
 def checked_int(value, low, high, field):
@@ -103,6 +107,27 @@ def convert_rule(row, protocol):
     return direction, rule
 
 
+def convert_service_rule(row):
+    protocol = row["protocol"].strip().lower()
+    if protocol not in PROTOCOLS:
+        raise ValueError("service.csvのprotocolにはtcp/udp/icmp/allを指定してください")
+    unused_fields = {
+        "tcp": ("type", "code"),
+        "udp": ("type", "code"),
+        "icmp": ("dst_min", "dst_max"),
+        "all": ("dst_min", "dst_max", "type", "code"),
+    }[protocol]
+    nonempty = [field for field in unused_fields if row[field].strip()]
+    if nonempty:
+        raise ValueError(
+            f"service.csvの{protocol}行では次の列を空欄にしてください: {', '.join(nonempty)}"
+        )
+    # The dedicated file always represents service CIDR labels. Reuse the
+    # normal converter without changing its legacy CSV compatibility.
+    service_row = dict(row, address_type="SERVICE_CIDR_BLOCK")
+    return convert_rule(service_row, protocol)
+
+
 def read_csv(path, protocol):
     result = []
     with path.open("r", newline="", encoding="utf-8-sig") as stream:
@@ -112,10 +137,11 @@ def read_csv(path, protocol):
             raise ValueError(f"{path}: CSVのヘッダー行がありません")
         if len(actual) != len(set(actual)):
             raise ValueError(f"{path}: CSVヘッダーが重複しています")
-        # address_type was added later; old CSV headers remain supported.
-        required = set(CSV_FIELDS[protocol]) - {"address_type"}
+        fields = SERVICE_FIELDS if protocol == "service" else CSV_FIELDS[protocol]
+        # address_type is optional only in the four legacy protocol CSVs.
+        required = set(fields) if protocol == "service" else set(fields) - {"address_type"}
         missing = required - set(actual)
-        unexpected = set(actual) - set(CSV_FIELDS[protocol])
+        unexpected = set(actual) - set(fields)
         if missing or unexpected:
             raise ValueError(
                 f"{path}: CSVヘッダー不一致（不足={sorted(missing)}, 余分={sorted(unexpected)}）"
@@ -127,13 +153,54 @@ def read_csv(path, protocol):
             if not any(value for value in row.values()):
                 continue
             try:
-                result.append(convert_rule(row, protocol))
+                converted = (convert_service_rule(row) if protocol == "service"
+                             else convert_rule(row, protocol))
+                result.append(converted)
             except ValueError as exc:
                 raise ValueError(f"{path}:{line_no}: {exc}") from exc
     return result
 
 
+def check_unconverted_report(input_dir):
+    path = input_dir / "unconverted-rules.json"
+    if not path.exists() and not path.is_symlink():
+        return  # Old, manually maintained CSV directories have no report.
+
+    guidance = ("未変換ルールのレポートを確認し、未対応・不正ルールを解決してください。"
+                "不完全なCSVから既存ルールを置き換えるJSONは生成しません")
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"JSONキーが重複しています: {key}")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError(f"JSONの非標準数値は使用できません: {value}")
+
+    try:
+        with path.open("r", encoding="utf-8-sig") as stream:
+            report = json.load(stream, object_pairs_hook=unique_object,
+                               parse_constant=reject_constant)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{path}: 未変換レポートの読み込みに失敗しました。{guidance}: {exc}") from exc
+
+    if not isinstance(report, dict):
+        raise ValueError(f"{path}: レポートはJSONオブジェクトが必要です。{guidance}")
+    if type(report.get("format_version")) is not int or report["format_version"] != 1:
+        raise ValueError(f"{path}: 未対応または不正なformat_versionです。{guidance}")
+    if report.get("status") != "complete":
+        raise ValueError(f"{path}: 変換状態がcompleteではありません。{guidance}")
+    for direction in ("ingress", "egress"):
+        entries = report.get(direction)
+        if not isinstance(entries, list) or entries:
+            raise ValueError(f"{path}: {direction}の未変換ルールが残るか、配列形式が不正です。{guidance}")
+
+
 def convert_all(input_dir, output_dir, force):
+    check_unconverted_report(input_dir)
     rules = {"ingress": [], "egress": []}
     for protocol in CSV_FIELDS:
         path = input_dir / f"{protocol}.csv"
@@ -141,6 +208,17 @@ def convert_all(input_dir, output_dir, force):
             raise ValueError(f"入力CSVがありません: {path}")
         for direction, rule in read_csv(path, protocol):
             rules[direction].append(rule)
+
+    service_path = input_dir / "service.csv"
+    if service_path.exists() or service_path.is_symlink():
+        if not service_path.is_file():
+            raise ValueError(f"service.csvはCSVファイルが必要です: {service_path}")
+        for direction, rule in read_csv(service_path, "service"):
+            rules[direction].append(rule)
+    # Stable sorting retains the legacy protocol order. Within one protocol,
+    # legacy CSV rows precede service.csv rows; duplicates are not removed.
+    for direction in rules:
+        rules[direction].sort(key=lambda rule: PROTOCOL_ORDER[rule["protocol"]])
 
     paths = {key: output_dir / f"{key}.json" for key in rules}
     existing = [str(path) for path in paths.values() if path.exists()]
@@ -177,7 +255,9 @@ def convert_all(input_dir, output_dir, force):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OCI Security List: 4種のCSVをIngress/Egress JSONへ変換")
+    parser = argparse.ArgumentParser(
+        description="OCI Security List: 4種のCSVと任意のservice.csvをIngress/Egress JSONへ変換"
+    )
     parser.add_argument("--input-dir", type=Path, default=Path("."))
     parser.add_argument("--output-dir", type=Path, default=Path("."))
     parser.add_argument("--force", action="store_true", help="既存のJSONを上書きする")
