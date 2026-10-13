@@ -199,6 +199,37 @@ def check_unconverted_report(input_dir):
             raise ValueError(f"{path}: {direction}の未変換ルールが残るか、配列形式が不正です。{guidance}")
 
 
+def format_json_rule(rule, direction):
+    """Serialize a generated rule with the requested ordered, hyphenated keys."""
+    address_key = "source" if direction == "ingress" else "destination"
+
+    def port_options(name):
+        options = rule.get(name)
+        if options is None:
+            return None
+
+        def port_range(name):
+            value = options.get(name)
+            return None if value is None else {"min": value["min"], "max": value["max"]}
+
+        return {
+            "destination-port-range": port_range("destinationPortRange"),
+            "source-port-range": port_range("sourcePortRange"),
+        }
+
+    icmp = rule.get("icmpOptions")
+    return {
+        "description": rule.get("description"),
+        address_key: rule[address_key],
+        address_key + "-type": rule[address_key + "Type"],
+        "protocol": rule["protocol"],
+        "icmp-options": None if icmp is None else {"type": icmp["type"], "code": icmp.get("code")},
+        "is-stateless": rule["isStateless"],
+        "tcp-options": port_options("tcpOptions"),
+        "udp-options": port_options("udpOptions"),
+    }
+
+
 def convert_all(input_dir, output_dir, force):
     check_unconverted_report(input_dir)
     rules = {"ingress": [], "egress": []}
@@ -236,7 +267,8 @@ def convert_all(input_dir, output_dir, force):
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n",
                                              dir=output_dir, suffix=".tmp", delete=False) as temp:
                 staged[direction] = Path(temp.name)
-                json.dump(rules[direction], temp, ensure_ascii=False, indent=2)
+                formatted = [format_json_rule(rule, direction) for rule in rules[direction]]
+                json.dump(formatted, temp, ensure_ascii=False, indent=2)
                 temp.write("\n")
         for direction in ("ingress", "egress"):
             if force:

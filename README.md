@@ -32,7 +32,9 @@ examples/
 python oci_security_list_csv_to_json.py --input-dir examples/csv --output-dir local-data/from-csv
 ```
 
-`local-data/from-csv/ingress.json`と`egress.json`が作成されます。出力は`isStateless`、`tcpOptions`、`destinationPortRange`などcamelCaseのキーを使用したJSON配列です。
+`local-data/from-csv/ingress.json`と`egress.json`が作成されます。出力はget形式と同じハイフン区切りのキーを使用したJSON配列です。ルールごとのキー順は、`description`、`source`/`destination`、`source-type`/`destination-type`、`protocol`、`icmp-options`、`is-stateless`、`tcp-options`、`udp-options`です。
+
+未設定の説明文やプロトコル別オプションは、省略せず`null`で出力します。TCP/UDPオプション内は`destination-port-range`、`source-port-range`の順で、範囲内は`min`、`max`の順です。未設定の送信元ポート範囲は`null`、ICMPのコード未指定は`code: null`になります。`examples/json/ingress.json`と`egress.json`もこの形式です。
 
 ### OCI CLI入力用JSON配列からCSVへ
 
@@ -222,7 +224,7 @@ ETag不一致の場合は対象が変更されています。再取得して内�
 python -m unittest discover -s tests -v
 ```
 
-57件の自動テストで、両方向・4種類のプロトコル・get形式・説明文の往復、サービス専用CSV、IP CIDRとの分離、旧CSVとの互換性、未変換JSONの原文保持、入力全体の失敗保存、不正レポートの検出、上書き防止、出力準備中の失敗時の既存ファイル保護を確認しています。Windows/Python 3.13で成功しました。Python 3.9以上向けに実装していますが、全バージョン・全OSでの実行試験は行っていません。
+自動テストで、両方向・4種類のプロトコル・get形式・説明文の往復、サービス専用CSV、IP CIDRとの分離、旧CSVとの互換性、未変換JSONの原文保持、入力全体の失敗保存、不正レポートの検出、上書き防止、出力準備中の失敗時の既存ファイル保護を確認しています。今回のJSON形式変更は、Windows/Python 3.13でキー順・null補完・CSV往復を確認する4件の簡単なテストが成功しました。Python 3.9以上向けに実装していますが、全バージョン・全OSでの実行試験は行っていません。
 
 出力はすべてのファイルを一時書込みしてから、1ファイルずつ確定します。複数ファイル全体を一括で更新する保証はありません。レポートだけで出力一式の完全性を保証するものではありません。出力の確定中にディスク障害などが発生した場合は、別の空ディレクトリで再実行し、出力一式を確認してください。Windows以外では、`--force`なしの出力にハードリンクを使うため、対応するファイルシステム上の保存先を使用してください。
 

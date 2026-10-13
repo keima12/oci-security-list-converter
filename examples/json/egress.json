@@ -1,45 +1,67 @@
 [
   {
-    "protocol": "6",
-    "isStateless": true,
-    "destination": "198.51.100.0/24",
-    "destinationType": "CIDR_BLOCK",
     "description": "文書用TCP宛先ポート範囲",
-    "tcpOptions": {"destinationPortRange": {"min": 1024, "max": 2048}}
+    "destination": "198.51.100.0/24",
+    "destination-type": "CIDR_BLOCK",
+    "protocol": "6",
+    "icmp-options": null,
+    "is-stateless": true,
+    "tcp-options": {
+      "destination-port-range": {
+        "min": 1024,
+        "max": 2048
+      },
+      "source-port-range": null
+    },
+    "udp-options": null
   },
   {
-    "protocol": "6",
-    "isStateless": false,
-    "destination": "all-phx-services-in-oracle-services-network",
-    "destinationType": "SERVICE_CIDR_BLOCK",
     "description": "公開サービスラベルを使ったEgress形式例",
-    "tcpOptions": {
-      "destinationPortRange": {
+    "destination": "all-phx-services-in-oracle-services-network",
+    "destination-type": "SERVICE_CIDR_BLOCK",
+    "protocol": "6",
+    "icmp-options": null,
+    "is-stateless": false,
+    "tcp-options": {
+      "destination-port-range": {
         "min": 443,
         "max": 443
-      }
-    }
+      },
+      "source-port-range": null
+    },
+    "udp-options": null
   },
   {
-    "protocol": "17",
-    "isStateless": true,
+    "description": "文書用UDP全宛先ポート",
     "destination": "198.51.100.0/24",
-    "destinationType": "CIDR_BLOCK",
-    "description": "文書用UDP全宛先ポート"
+    "destination-type": "CIDR_BLOCK",
+    "protocol": "17",
+    "icmp-options": null,
+    "is-stateless": true,
+    "tcp-options": null,
+    "udp-options": null
   },
   {
-    "protocol": "1",
-    "isStateless": false,
-    "destination": "203.0.113.0/24",
-    "destinationType": "CIDR_BLOCK",
     "description": "文書用ICMPタイプ指定・コード省略",
-    "icmpOptions": {"type": 8}
+    "destination": "203.0.113.0/24",
+    "destination-type": "CIDR_BLOCK",
+    "protocol": "1",
+    "icmp-options": {
+      "type": 8,
+      "code": null
+    },
+    "is-stateless": false,
+    "tcp-options": null,
+    "udp-options": null
   },
   {
-    "protocol": "all",
-    "isStateless": false,
+    "description": "文書用IPv4 ALL例",
     "destination": "203.0.113.0/24",
-    "destinationType": "CIDR_BLOCK",
-    "description": "文書用IPv4 ALL例"
+    "destination-type": "CIDR_BLOCK",
+    "protocol": "all",
+    "icmp-options": null,
+    "is-stateless": false,
+    "tcp-options": null,
+    "udp-options": null
   }
 ]

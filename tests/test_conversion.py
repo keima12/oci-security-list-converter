@@ -29,6 +29,18 @@ CSV_TO_JSON = load_module("oci_security_list_csv_to_json")
 JSON_TO_CSV = load_module("oci_security_list_json_to_csv")
 
 
+def rule_meanings(value):
+    """Compare optional nulls and omitted keys by meaning in round-trip tests."""
+    def omit_nulls(item):
+        if isinstance(item, dict):
+            return {key: omit_nulls(value) for key, value in item.items() if value is not None}
+        if isinstance(item, list):
+            return [omit_nulls(value) for value in item]
+        return item
+
+    return omit_nulls(JSON_TO_CSV.normalize_keys(value))
+
+
 def make_rule(direction, protocol_code, **extra):
     address = "source" if direction == "ingress" else "destination"
     address_type = "sourceType" if direction == "ingress" else "destinationType"
@@ -61,13 +73,15 @@ def hyphen_keys(value):
 
 class ConversionTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(dir=ROOT, prefix=".test-")
+        # Use the system temp directory to avoid locks from repository sync tools.
+        self.temporary = tempfile.TemporaryDirectory(prefix="oci-security-list-converter-test-")
         self.work = Path(self.temporary.name)
         self.addCleanup(self.cleanup_workspace)
 
     def cleanup_workspace(self):
         # Verify the generated workspace before recursively removing it.
-        if self.work.resolve().parent != ROOT.resolve() or not self.work.name.startswith(".test-"):
+        if (self.work.resolve().parent != Path(tempfile.gettempdir()).resolve()
+                or not self.work.name.startswith("oci-security-list-converter-test-")):
             raise RuntimeError("Unexpected temporary test directory")
         self.temporary.cleanup()
 
@@ -90,7 +104,7 @@ class ConversionTests(unittest.TestCase):
         output = output or self.work / "json"
         with contextlib.redirect_stdout(io.StringIO()):
             CSV_TO_JSON.convert_all(directory, output, force)
-        return {direction: json.loads((output / f"{direction}.json").read_text(encoding="utf-8"))
+        return {direction: rule_meanings(json.loads((output / f"{direction}.json").read_text(encoding="utf-8")))
                 for direction in ("ingress", "egress")}
 
     def write_tables(self, tables=None, legacy=False):
@@ -182,6 +196,59 @@ class ConversionTests(unittest.TestCase):
                 }),
             ]
         return rules
+
+    def test_json_output_matches_service_egress_sample(self):
+        self.import_csv(ROOT / "examples/csv")
+        rules = json.loads((self.work / "json/egress.json").read_text(encoding="utf-8"))
+        actual = next(rule for rule in rules
+                      if rule["destination"] == "all-phx-services-in-oracle-services-network")
+        expected = {
+            "description": "公開サービスラベルを使ったEgress形式例",
+            "destination": "all-phx-services-in-oracle-services-network",
+            "destination-type": "SERVICE_CIDR_BLOCK",
+            "protocol": "6",
+            "icmp-options": None,
+            "is-stateless": False,
+            "tcp-options": {"destination-port-range": {"min": 443, "max": 443},
+                            "source-port-range": None},
+            "udp-options": None,
+        }
+        self.assertEqual(actual, expected)
+        self.assertEqual(list(actual), list(expected))
+        self.assertEqual(list(actual["tcp-options"]), ["destination-port-range", "source-port-range"])
+        self.assertEqual(list(actual["tcp-options"]["destination-port-range"]), ["min", "max"])
+
+    def test_json_output_key_order_and_nulls_for_both_directions(self):
+        tables = {}
+        for protocol in ("tcp", "udp", "icmp", "all"):
+            tables[protocol] = []
+            for direction in ("ingress", "egress"):
+                row = self.row(protocol)
+                row["direction"] = direction
+                if protocol == "icmp":
+                    row["type"] = "8"
+                if protocol == "udp":
+                    row.update(dst_min="53", dst_max="53")
+                tables[protocol].append(row)
+        self.import_csv(self.write_tables(tables))
+        for direction in ("ingress", "egress"):
+            address = "source" if direction == "ingress" else "destination"
+            rules = json.loads((self.work / "json" / (direction + ".json")).read_text(encoding="utf-8"))
+            for rule in rules:
+                self.assertEqual(list(rule), ["description", address, address + "-type", "protocol",
+                                             "icmp-options", "is-stateless", "tcp-options", "udp-options"])
+                self.assertIsNone(rule["description"])
+                self.assertIsNone(rule["tcp-options"])
+                self.assertEqual(rule["icmp-options"], {"type": 8, "code": None}
+                                 if rule["protocol"] == "1" else None)
+                if rule["icmp-options"] is not None:
+                    self.assertEqual(list(rule["icmp-options"]), ["type", "code"])
+                if rule["protocol"] == "17":
+                    self.assertEqual(rule["udp-options"], {"destination-port-range": {"min": 53, "max": 53},
+                                                          "source-port-range": None})
+                    self.assertEqual(list(rule["udp-options"]), ["destination-port-range", "source-port-range"])
+                else:
+                    self.assertIsNone(rule["udp-options"])
 
     def test_arrays_round_trip_all_protocols_directions_and_descriptions(self):
         rules = self.rich_rules()
@@ -1020,7 +1087,7 @@ class ConversionTests(unittest.TestCase):
         self.assertFalse((self.work / "json").exists())
 
     def test_public_examples_arrays_get_and_five_csvs_have_identical_rule_meanings(self):
-        expected = {direction: json.loads((ROOT / "examples/json" / f"{direction}.json").read_text(encoding="utf-8-sig"))
+        expected = {direction: rule_meanings(json.loads((ROOT / "examples/json" / f"{direction}.json").read_text(encoding="utf-8-sig")))
                     for direction in ("ingress", "egress")}
         from_get = self.export(get=ROOT / "examples/oci-get.json")
         self.assert_complete_report(from_get)
