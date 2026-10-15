@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OCI Security List JSON -> protocol CSVs plus a dedicated service.csv.
+"""OCI Security List JSON -> rules.csv, or optional purpose-specific CSVs.
 
 Supports:
   - CLI rule arrays: --ingress ingress.json --egress egress.json
@@ -30,6 +30,8 @@ CSV_FIELDS = {
     "service": ["direction", "cidr", "protocol", "dst_min", "dst_max", "type", "code",
                 "stateless", "description"],
 }
+COMBINED_FIELDS = ["direction", "cidr", "address_type", "protocol", "dst_min",
+                   "dst_max", "type", "code", "stateless", "description"]
 REPORT_FILENAME = "unconverted-rules.json"
 PROTOCOL_TO_CSV = {"6": "tcp", "17": "udp", "1": "icmp", "all": "all"}
 COMMON_FIELDS = {
@@ -95,7 +97,7 @@ def port_columns(rule, protocol, where):
     opt_name = "tcpOptions" if protocol == "tcp" else "udpOptions"
     options = rule.get(opt_name)
     if options is None:
-        return "all", "all"
+        return None, None
     if not isinstance(options, dict):
         die(f"{where}: {opt_name}はオブジェクトが必要です")
     check_fields(options, {"destinationPortRange", "sourcePortRange"}, where)
@@ -103,7 +105,7 @@ def port_columns(rule, protocol, where):
         die(f"{where}: 送信元ポート制限（sourcePortRange）は現在のCSV形式で表現できません")
     pr = options.get("destinationPortRange")
     if pr is None:
-        return "all", "all"
+        return None, None
     if not isinstance(pr, dict):
         die(f"{where}: destinationPortRangeはオブジェクトが必要です")
     check_fields(pr, {"min", "max"}, where)
@@ -159,10 +161,8 @@ def convert_rule(raw, direction, index):
     if not isinstance(stateless, bool):
         die(f"{where}: isStatelessはtrue/falseで指定してください")
 
-    description = rule.get("description", "")
-    if description is None:
-        description = ""
-    if not isinstance(description, str):
+    description = rule.get("description")
+    if description is not None and not isinstance(description, str):
         die(f"{where}: descriptionは文字列である必要があります")
 
     csv_row = {
@@ -183,7 +183,7 @@ def convert_rule(raw, direction, index):
     elif name == "icmp":
         options = rule.get("icmpOptions")
         if options is None:
-            csv_row["type"], csv_row["code"] = "", ""
+            csv_row["type"], csv_row["code"] = None, None
         else:
             if not isinstance(options, dict):
                 die(f"{where}: icmpOptionsはオブジェクトが必要です")
@@ -192,17 +192,18 @@ def convert_rule(raw, direction, index):
                 die(f"{where}: icmpOptions.typeがありません")
             csv_row["type"] = integer(options["type"], f"{where}: ICMP type", 0, 255)
             code = options.get("code")
-            csv_row["code"] = "" if code is None else integer(code, f"{where}: ICMP code", 0, 255)
+            csv_row["code"] = None if code is None else integer(code, f"{where}: ICMP code", 0, 255)
 
     # Validate UTF-8 here so an unrepresentable value is kept with its original
     # rule in the report instead of preventing other rules from being exported.
     address.encode("utf-8")
-    description.encode("utf-8")
+    if description is not None:
+        description.encode("utf-8")
     if addr_type == "SERVICE_CIDR_BLOCK":
         del csv_row["address_type"]
         csv_row["protocol"] = name
         for unused in ("dst_min", "dst_max", "type", "code"):
-            csv_row.setdefault(unused, "")
+            csv_row.setdefault(unused, None)
         return "service", csv_row
     return name, csv_row
 
@@ -234,9 +235,30 @@ def read_inputs(args):
     return ingress, egress
 
 
+def encode_csv_row(row, fields):
+    """Use NULL for absent values; escape literal NULL/backslashes in text."""
+    result = {}
+    for field in fields:
+        value = row.get(field)
+        if value is None:
+            value = "NULL"
+        elif field in ("description", "cidr") and (value == "NULL" or value.startswith("\\")):
+            value = "\\" + value
+        result[field] = value
+    return result
+
+
 def export_csv(args):
     ingress, egress = read_inputs(args)
-    tables = {name: [] for name in CSV_FIELDS}
+    only = getattr(args, "only", None)
+    split = getattr(args, "split", False)
+    if only and (split or any(name not in CSV_FIELDS for name in only)):
+        die("--onlyにはtcp/udp/icmp/all/serviceを指定し、--splitとは併用しないでください")
+    selected = list(dict.fromkeys(only)) if only else list(CSV_FIELDS)
+    schemas = ({name: CSV_FIELDS[name] for name in selected}
+               if split or only else {"rules": COMBINED_FIELDS})
+    tables = {name: [] for name in schemas}
+    excluded_count = 0
     report = {"format_version": 1, "status": "complete", "ingress": [], "egress": []}
     for direction, entries in (("ingress", ingress), ("egress", egress)):
         for index, item in enumerate(entries, start=1):
@@ -245,13 +267,32 @@ def export_csv(args):
             except ValueError as exc:
                 report[direction].append({"index": index, "error": str(exc), "rule": item})
             else:
-                tables[name].append(converted)
+                if name not in selected:
+                    excluded_count += 1
+                elif "rules" in tables:
+                    combined = dict(converted)
+                    combined["address_type"] = ("SERVICE_CIDR_BLOCK" if name == "service"
+                                                else combined["address_type"])
+                    combined.setdefault("protocol", name)
+                    tables["rules"].append(combined)
+                else:
+                    tables[name].append(converted)
     unconverted_count = len(report["ingress"]) + len(report["egress"])
     if unconverted_count:
         report["status"] = "partial"
 
+    if only:
+        report["selected_purposes"] = selected
+        report["excluded_count"] = excluded_count
+
     output_dir = args.output_dir
-    paths = {name: output_dir / f"{name}.csv" for name in CSV_FIELDS}
+    paths = {name: output_dir / f"{name}.csv" for name in schemas}
+    # Do not mix stale exports from different modes or selections.
+    conflicting = [output_dir / f"{name}.csv" for name in ["rules", *CSV_FIELDS]
+                   if name not in schemas and (output_dir / f"{name}.csv").exists()]
+    if conflicting:
+        die("別の出力形式・用途のCSVがあります。空の出力フォルダを指定してください: "
+            + ", ".join(str(path) for path in conflicting))
     paths["report"] = output_dir / REPORT_FILENAME
     existing = [str(path) for path in paths.values() if path.exists()]
     if existing and not args.force:
@@ -261,18 +302,17 @@ def export_csv(args):
         die(f"出力先がディレクトリではありません: {output_dir}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Prepare all five CSVs and the report before publishing any output.
-    # Publication is per file, not an atomic transaction across all six files.
+    # Stage the selected CSV outputs and report before publishing per file.
     staged = {}
     try:
-        for name, fields in CSV_FIELDS.items():
+        for name, fields in schemas.items():
             # utf-8-sig makes Japanese descriptions easy to open in Excel.
             with tempfile.NamedTemporaryFile("w", encoding="utf-8-sig", newline="",
                                              dir=output_dir, suffix=".tmp", delete=False) as temp:
                 staged[name] = Path(temp.name)
                 writer = csv.DictWriter(temp, fieldnames=fields, lineterminator="\n")
                 writer.writeheader()
-                writer.writerows(tables[name])
+                writer.writerows(encode_csv_row(row, fields) for row in tables[name])
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n",
                                          dir=output_dir, suffix=".tmp", delete=False) as temp:
             staged["report"] = Path(temp.name)
@@ -352,12 +392,16 @@ class ReportArgumentParser(argparse.ArgumentParser):
 
 def main():
     parser = ReportArgumentParser(
-        description="OCIセキュリティリストJSONを4種のCSVとservice.csvへ変換し、未変換ルールをJSONに保存します。OCIへの変更は行いません。"
+        description="OCIセキュリティリストJSONを統合CSV（任意で用途別CSV）へ変換し、未変換ルールをJSONに保存します。OCIへの変更は行いません。"
     )
     parser.add_argument("--ingress", type=Path, help="ingress.json（JSON配列）")
     parser.add_argument("--egress", type=Path, help="egress.json（JSON配列）")
     parser.add_argument("--oci-get", type=Path, help="oci network security-list get のJSON出力")
     parser.add_argument("--output-dir", type=Path, default=Path("csv_export"), help="CSV出力先（既定: csv_export）")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--split", action="store_true", help="5用途別のCSVに分割する")
+    mode.add_argument("--only", nargs="+", choices=list(CSV_FIELDS),
+                      help="指定用途だけを個別CSVに出力（例: --only tcp service）")
     parser.add_argument("--force", action="store_true", help="既存CSVとレポートを上書き")
     args = argparse.Namespace()
     try:

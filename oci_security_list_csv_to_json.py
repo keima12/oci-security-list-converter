@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert four protocol CSVs and optional service.csv into OCI rule JSON arrays.
+"""Convert rules.csv or legacy purpose-specific CSVs into OCI rule JSON arrays.
 
 The `description` column is preserved as Unicode text without stripping spaces,
 including commas, double quotes and embedded newlines. No OCI API calls are made.
@@ -24,6 +24,8 @@ CSV_FIELDS = {
 }
 SERVICE_FIELDS = ["direction", "cidr", "protocol", "dst_min", "dst_max",
                   "type", "code", "stateless", "description"]
+COMBINED_FIELDS = ["direction", "cidr", "address_type", "protocol", "dst_min",
+                   "dst_max", "type", "code", "stateless", "description"]
 PROTOCOLS = {"tcp": "6", "udp": "17", "icmp": "1", "all": "all"}
 PROTOCOL_ORDER = {code: index for index, code in enumerate(PROTOCOLS.values())}
 
@@ -38,6 +40,17 @@ def checked_int(value, low, high, field):
 
 
 def convert_rule(row, protocol):
+    row = dict(row)
+    # Explicit NULL port pairs represent unrestricted ports; old all/all stays valid.
+    if protocol in ("tcp", "udp") and all(row.get(key) == "NULL" for key in ("dst_min", "dst_max")):
+        row.update(dst_min="all", dst_max="all")
+    for field, value in row.items():
+        if value == "NULL":
+            row[field] = ""
+        elif field in ("description", "cidr") and value.startswith("\\"):
+            tail = value[1:]
+            if tail == "NULL" or tail.startswith("\\"):
+                row[field] = tail
     direction = row["direction"].strip().lower()
     if direction not in ("ingress", "egress"):
         raise ValueError("directionにはingressまたはegressを指定してください")
@@ -107,25 +120,30 @@ def convert_rule(row, protocol):
     return direction, rule
 
 
-def convert_service_rule(row):
+def convert_generic_rule(row, service=False):
     protocol = row["protocol"].strip().lower()
     if protocol not in PROTOCOLS:
-        raise ValueError("service.csvのprotocolにはtcp/udp/icmp/allを指定してください")
+        raise ValueError("CSVのprotocolにはtcp/udp/icmp/allを指定してください")
     unused_fields = {
         "tcp": ("type", "code"),
         "udp": ("type", "code"),
         "icmp": ("dst_min", "dst_max"),
         "all": ("dst_min", "dst_max", "type", "code"),
     }[protocol]
-    nonempty = [field for field in unused_fields if row[field].strip()]
+    nonempty = [field for field in unused_fields if row[field].strip() and row[field] != "NULL"]
     if nonempty:
         raise ValueError(
-            f"service.csvの{protocol}行では次の列を空欄にしてください: {', '.join(nonempty)}"
+            f"CSVの{protocol}行では次の列を空欄またはNULLにしてください: {', '.join(nonempty)}"
         )
-    # The dedicated file always represents service CIDR labels. Reuse the
-    # normal converter without changing its legacy CSV compatibility.
-    service_row = dict(row, address_type="SERVICE_CIDR_BLOCK")
-    return convert_rule(service_row, protocol)
+    # Dedicated service.csv implies the service address type; rules.csv
+    # keeps the explicit address_type from each row.
+    if service:
+        row = dict(row, address_type="SERVICE_CIDR_BLOCK")
+    return convert_rule(row, protocol)
+
+
+def convert_service_rule(row):
+    return convert_generic_rule(row, service=True)
 
 
 def read_csv(path, protocol):
@@ -137,9 +155,10 @@ def read_csv(path, protocol):
             raise ValueError(f"{path}: CSVのヘッダー行がありません")
         if len(actual) != len(set(actual)):
             raise ValueError(f"{path}: CSVヘッダーが重複しています")
-        fields = SERVICE_FIELDS if protocol == "service" else CSV_FIELDS[protocol]
+        fields = (COMBINED_FIELDS if protocol == "rules" else
+                  SERVICE_FIELDS if protocol == "service" else CSV_FIELDS[protocol])
         # address_type is optional only in the four legacy protocol CSVs.
-        required = set(fields) if protocol == "service" else set(fields) - {"address_type"}
+        required = set(fields) if protocol in ("service", "rules") else set(fields) - {"address_type"}
         missing = required - set(actual)
         unexpected = set(actual) - set(fields)
         if missing or unexpected:
@@ -153,8 +172,9 @@ def read_csv(path, protocol):
             if not any(value for value in row.values()):
                 continue
             try:
-                converted = (convert_service_rule(row) if protocol == "service"
-                             else convert_rule(row, protocol))
+                converted = (convert_service_rule(row) if protocol == "service" else
+                             convert_generic_rule(row) if protocol == "rules" else
+                             convert_rule(row, protocol))
                 result.append(converted)
             except ValueError as exc:
                 raise ValueError(f"{path}:{line_no}: {exc}") from exc
@@ -193,6 +213,9 @@ def check_unconverted_report(input_dir):
         raise ValueError(f"{path}: 未対応または不正なformat_versionです。{guidance}")
     if report.get("status") != "complete":
         raise ValueError(f"{path}: 変換状態がcompleteではありません。{guidance}")
+    excluded = report.get("excluded_count", 0)
+    if type(excluded) is not int or excluded != 0:
+        raise ValueError(f"{path}: 用途指定で除外されたルールがあります。全用途を再出力してください。{guidance}")
     for direction in ("ingress", "egress"):
         entries = report.get(direction)
         if not isinstance(entries, list) or entries:
@@ -233,21 +256,24 @@ def format_json_rule(rule, direction):
 def convert_all(input_dir, output_dir, force):
     check_unconverted_report(input_dir)
     rules = {"ingress": [], "egress": []}
-    for protocol in CSV_FIELDS:
-        path = input_dir / f"{protocol}.csv"
+    combined_path = input_dir / "rules.csv"
+    legacy_paths = [input_dir / f"{name}.csv" for name in [*CSV_FIELDS, "service"]]
+    if combined_path.exists() or combined_path.is_symlink():
+        if any(path.exists() or path.is_symlink() for path in legacy_paths):
+            raise ValueError("rules.csvと用途別CSVは同じ入力フォルダに混在できません")
+        inputs = [(combined_path, "rules")]
+    else:
+        inputs = [(input_dir / f"{name}.csv", name) for name in CSV_FIELDS]
+        service_path = input_dir / "service.csv"
+        if service_path.exists() or service_path.is_symlink():
+            inputs.append((service_path, "service"))
+    for path, protocol in inputs:
         if not path.is_file():
             raise ValueError(f"入力CSVがありません: {path}")
         for direction, rule in read_csv(path, protocol):
             rules[direction].append(rule)
-
-    service_path = input_dir / "service.csv"
-    if service_path.exists() or service_path.is_symlink():
-        if not service_path.is_file():
-            raise ValueError(f"service.csvはCSVファイルが必要です: {service_path}")
-        for direction, rule in read_csv(service_path, "service"):
-            rules[direction].append(rule)
-    # Stable sorting retains the legacy protocol order. Within one protocol,
-    # legacy CSV rows precede service.csv rows; duplicates are not removed.
+    # Stable sorting groups protocols and preserves input order within each.
+    # In split mode, legacy CSV rows precede service.csv rows; keep duplicates.
     for direction in rules:
         rules[direction].sort(key=lambda rule: PROTOCOL_ORDER[rule["protocol"]])
 
@@ -288,7 +314,7 @@ def convert_all(input_dir, output_dir, force):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="OCI Security List: 4種のCSVと任意のservice.csvをIngress/Egress JSONへ変換"
+        description="OCI Security List: rules.csv、または4種のCSVと任意のservice.csvをIngress/Egress JSONへ変換"
     )
     parser.add_argument("--input-dir", type=Path, default=Path("."))
     parser.add_argument("--output-dir", type=Path, default=Path("."))

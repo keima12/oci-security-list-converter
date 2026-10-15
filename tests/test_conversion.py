@@ -92,7 +92,7 @@ class ConversionTests(unittest.TestCase):
 
     def export(self, ingress=None, egress=None, output=None, force=False, get=None):
         args = argparse.Namespace(oci_get=get, ingress=None, egress=None,
-                                  output_dir=output or self.work / "csv", force=force)
+                                  output_dir=output or self.work / "csv", force=force, split=True, only=None)
         if get is None:
             args.ingress = self.write_json("ingress-input.json", ingress or [])
             args.egress = self.write_json("egress-input.json", egress or [])
@@ -157,7 +157,7 @@ class ConversionTests(unittest.TestCase):
     def run_json_cli(self, arguments, output=None, force=False):
         output = output or self.work / "cli-csv"
         command = [sys.executable, str(ROOT / "oci_security_list_json_to_csv.py"),
-                   "--output-dir", str(output)] + arguments
+                   "--output-dir", str(output), "--split"] + arguments
         if force:
             command.append("--force")
         return subprocess.run(command, cwd=self.work, capture_output=True), output
@@ -314,9 +314,9 @@ class ConversionTests(unittest.TestCase):
         self.assertEqual([row["cidr"] for row in rows], ["oci-example-objectstorage"] * 8)
         self.assertNotIn("address_type", rows[0])
         self.assertEqual((rows[0]["dst_min"], rows[0]["dst_max"], rows[0]["type"], rows[0]["code"]),
-                         ("443", "443", "", ""))
+                         ("443", "443", "NULL", "NULL"))
         self.assertEqual((rows[2]["dst_min"], rows[2]["dst_max"], rows[2]["type"], rows[2]["code"]),
-                         ("", "", "3", "4"))
+                         ("NULL", "NULL", "3", "4"))
         self.assert_complete_report(directory)
         self.assertEqual(self.import_csv(directory), rules)
 
@@ -533,8 +533,8 @@ class ConversionTests(unittest.TestCase):
                 _, rule = CSV_TO_JSON.convert_rule(row, "icmp")
                 self.assertEqual(rule.get("icmpOptions"), expected)
                 _, exported = JSON_TO_CSV.convert_rule(rule, "ingress", 1)
-                self.assertEqual(str(exported["type"]), icmp_type)
-                self.assertEqual(str(exported["code"]), code)
+                self.assertEqual(str(exported["type"]) if exported["type"] is not None else "", icmp_type)
+                self.assertEqual(str(exported["code"]) if exported["code"] is not None else "", code)
 
     def test_csv_invalid_rule_values_are_rejected(self):
         cases = [

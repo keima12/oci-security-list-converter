@@ -1,0 +1,14 @@
+﻿direction,cidr,address_type,protocol,dst_min,dst_max,type,code,stateless,description
+ingress,192.0.2.0/24,CIDR_BLOCK,tcp,443,443,NULL,NULL,false,"文書用HTTPS例, ""説明文の引用符""を保持"
+ingress,2001:db8:1::/64,CIDR_BLOCK,tcp,NULL,NULL,NULL,NULL,false,文書用IPv6 TCP全宛先ポート
+ingress,oci-phx-objectstorage,SERVICE_CIDR_BLOCK,tcp,443,443,NULL,NULL,false,公開サービスラベルを使ったIngress形式例
+ingress,203.0.113.0/24,CIDR_BLOCK,udp,53,53,NULL,NULL,false,文書用UDP宛先ポート例
+ingress,192.0.2.0/24,CIDR_BLOCK,icmp,NULL,NULL,3,4,false,文書用Path MTU Discoveryの形式例
+ingress,198.51.100.0/24,CIDR_BLOCK,icmp,NULL,NULL,NULL,NULL,true,"文書用の全ICMP例
+説明文の改行を保持"
+ingress,2001:db8:2::/64,CIDR_BLOCK,all,NULL,NULL,NULL,NULL,false,文書用IPv6 ALL例
+egress,198.51.100.0/24,CIDR_BLOCK,tcp,1024,2048,NULL,NULL,true,文書用TCP宛先ポート範囲
+egress,all-phx-services-in-oracle-services-network,SERVICE_CIDR_BLOCK,tcp,443,443,NULL,NULL,false,公開サービスラベルを使ったEgress形式例
+egress,198.51.100.0/24,CIDR_BLOCK,udp,NULL,NULL,NULL,NULL,true,文書用UDP全宛先ポート
+egress,203.0.113.0/24,CIDR_BLOCK,icmp,NULL,NULL,8,NULL,false,文書用ICMPタイプ指定・コード省略
+egress,203.0.113.0/24,CIDR_BLOCK,all,NULL,NULL,NULL,NULL,false,文書用IPv4 ALL例
